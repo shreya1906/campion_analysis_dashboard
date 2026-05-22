@@ -2,6 +2,7 @@ import re
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+import plotly.graph_objects as go
 
 # ============================================================
 # Streamlit page setup and client-facing styling
@@ -176,6 +177,26 @@ def find_first_existing_col(df, candidates):
     return None
 
 
+def wrap_label(value, width=32):
+    """Insert line breaks into long category labels for more readable charts."""
+    text = str(value)
+    words = text.split()
+    lines = []
+    current = []
+    current_len = 0
+    for word in words:
+        if current and current_len + len(word) + 1 > width:
+            lines.append(" ".join(current))
+            current = [word]
+            current_len = len(word)
+        else:
+            current.append(word)
+            current_len += len(word) + (1 if current_len else 0)
+    if current:
+        lines.append(" ".join(current))
+    return "<br>".join(lines)
+
+
 def find_column_by_keywords(df, include_terms, exclude_terms=None):
     if exclude_terms is None:
         exclude_terms = []
@@ -195,20 +216,58 @@ def find_best_column(df, include_terms, exclude_terms=None):
     return matches[0] if matches else None
 
 
+def order_categories_by_keywords(series, keyword_order):
+    """
+    Return observed categories in a preferred conceptual order, using keyword matching
+    rather than exact text matching. This is safer for long SurveyMonkey labels.
+    """
+    observed = [str(x) for x in series.dropna().unique().tolist()]
+    ordered = []
+
+    for keyword_group in keyword_order:
+        keyword_group_norm = [norm_text(k) for k in keyword_group]
+        for category in observed:
+            category_norm = norm_text(category)
+            if category not in ordered and all(k in category_norm for k in keyword_group_norm):
+                ordered.append(category)
+
+    ordered += [category for category in observed if category not in ordered]
+    return ordered
+
+
 # ============================================================
 # Generic plotting helpers
 # ============================================================
 
-def plot_categorical_variable(df, col, title, x_title, chart_type="Bar - Percentage", horizontal=False, category_order=None):
-    summary = df[col].fillna("Missing").value_counts().reset_index()
+def plot_categorical_variable(
+    df,
+    col,
+    title,
+    x_title,
+    chart_type="Bar - Percentage",
+    horizontal=False,
+    category_order=None,
+    sort_by_value=True,
+    wrap_labels=False,
+    label_width=34,
+):
+    summary = df[col].fillna("Missing").value_counts(sort=False).reset_index()
     summary.columns = ["category", "count"]
     summary["percent"] = summary["count"] / summary["count"].sum() * 100
 
     if category_order is not None:
-        summary["category"] = pd.Categorical(summary["category"], categories=category_order, ordered=True)
+        final_order = [str(cat) for cat in category_order if str(cat) in set(summary["category"].astype(str))]
+        final_order += [cat for cat in summary["category"].astype(str).tolist() if cat not in final_order]
+        summary["category"] = pd.Categorical(summary["category"].astype(str), categories=final_order, ordered=True)
         summary = summary.sort_values("category")
-    else:
+    elif sort_by_value:
         summary = summary.sort_values("percent", ascending=False)
+    else:
+        final_order = summary["category"].astype(str).tolist()
+
+    summary["category_display"] = summary["category"].astype(str)
+    if wrap_labels:
+        summary["category_display"] = summary["category_display"].apply(lambda x: wrap_label(x, width=label_width))
 
     if chart_type == "Pie":
         fig = px.pie(summary, names="category", values="count", title=title, hole=0.35)
@@ -221,46 +280,72 @@ def plot_categorical_variable(df, col, title, x_title, chart_type="Bar - Percent
         return fig
 
     if chart_type == "Bar - Count":
-        y_col = "count"
-        y_label = "Number of Respondents"
-        text_values = summary["count"].astype(str)
+        value_col = "count"
+        value_label = "Number of Respondents"
+        summary["bar_label"] = summary["count"].astype(str)
     else:
-        y_col = "percent"
-        y_label = "Percentage of Respondents"
-        text_values = summary["percent"].round(1).astype(str) + "%"
+        value_col = "percent"
+        value_label = "Percentage of Respondents"
+        summary["bar_label"] = summary["percent"].round(1).astype(str) + "%"
 
     if horizontal:
-        summary = summary.sort_values(y_col)
+        if category_order is None and sort_by_value:
+            # For horizontal bars, ascending value order places the largest bars at the top visually.
+            summary = summary.sort_values(value_col, ascending=True)
+
         fig = px.bar(
             summary,
-            y="category",
-            x=y_col,
+            y="category_display",
+            x=value_col,
             orientation="h",
             title=title,
-            labels={"category": x_title, y_col: y_label},
-            text=text_values
+            labels={"category_display": x_title, value_col: value_label},
+            text="bar_label"
         )
         fig.update_traces(
-            textposition="inside",
-            customdata=summary[["count", "percent"]],
-            hovertemplate="<b>%{y}</b><br>Count: %{customdata[0]}<br>Percentage: %{customdata[1]:.1f}%<extra></extra>"
+            textposition="outside",
+            customdata=summary[["category", "count", "percent"]],
+            hovertemplate="<b>%{customdata[0]}</b><br>Count: %{customdata[1]}<br>Percentage: %{customdata[2]:.1f}%<extra></extra>"
         )
-        fig.update_layout(template="plotly_white", height=500, xaxis_title=y_label, yaxis_title=x_title)
+        fig.update_layout(
+            template="plotly_white",
+            height=max(480, 82 * len(summary)),
+            xaxis_title=value_label,
+            yaxis_title="",
+            margin=dict(t=90, b=60, l=20, r=130),
+            uniformtext_minsize=10,
+            uniformtext_mode="hide"
+        )
+        if category_order is not None:
+            display_order = [wrap_label(cat, label_width) if wrap_labels else cat for cat in final_order if cat in set(summary["category"].astype(str))]
+            display_order += [x for x in summary["category_display"].astype(str).tolist() if x not in display_order]
+            fig.update_yaxes(categoryorder="array", categoryarray=display_order[::-1])
     else:
         fig = px.bar(
             summary,
-            x="category",
-            y=y_col,
+            x="category_display",
+            y=value_col,
             title=title,
-            labels={"category": x_title, y_col: y_label},
-            text=text_values
+            labels={"category_display": x_title, value_col: value_label},
+            text="bar_label"
         )
         fig.update_traces(
-            textposition="inside",
-            customdata=summary[["count", "percent"]],
-            hovertemplate="<b>%{x}</b><br>Count: %{customdata[0]}<br>Percentage: %{customdata[1]:.1f}%<extra></extra>"
+            textposition="outside",
+            customdata=summary[["category", "count", "percent"]],
+            hovertemplate="<b>%{customdata[0]}</b><br>Count: %{customdata[1]}<br>Percentage: %{customdata[2]:.1f}%<extra></extra>"
         )
-        fig.update_layout(template="plotly_white", height=500, xaxis_tickangle=-25, xaxis_title=x_title, yaxis_title=y_label)
+        fig.update_layout(
+            template="plotly_white",
+            height=560,
+            xaxis_tickangle=-25,
+            xaxis_title=x_title,
+            yaxis_title=value_label,
+            margin=dict(t=90, b=140, l=70, r=40)
+        )
+        if category_order is not None:
+            display_order = [wrap_label(cat, label_width) if wrap_labels else cat for cat in final_order if cat in set(summary["category"].astype(str))]
+            display_order += [x for x in summary["category_display"].astype(str).tolist() if x not in display_order]
+            fig.update_xaxes(categoryorder="array", categoryarray=display_order)
 
     return fig
 
@@ -448,7 +533,7 @@ def plot_stage_facets(summary, stage_name, facet_wrap=2, height=800):
         title=f"{stage_name}: EdTech Product Use by Task",
         labels={
             "tool_label": "EdTech Product Type",
-            "percent_stage_respondents": f"Percentage of {stage_name} Respondents",
+            "percent_stage_respondents": "Percentage of Respondents",
             "tool_type": "EdTech Product Type"
         },
         text=plot_df["percent_stage_respondents"].round(1).astype(str) + "%",
@@ -463,12 +548,23 @@ def plot_stage_facets(summary, stage_name, facet_wrap=2, height=800):
     fig.update_layout(
         template="plotly_white",
         height=height,
-        yaxis_title=f"Percentage of {stage_name} Respondents",
         legend_title="EdTech Product Type",
-        margin=dict(t=90, b=50, l=60, r=40)
+        margin=dict(t=110, b=170, l=80, r=40)
     )
-    fig.update_xaxes(tickangle=0, title_text="")
-    fig.update_yaxes(range=[0, max(10, y_max + 10)])
+    fig.update_xaxes(tickangle=90, title_text="")
+    # Remove repeated y-axis titles from each facet. Repeated titles were overlapping
+    # vertically when several facet rows were shown together.
+    fig.update_yaxes(range=[0, max(10, y_max + 10)], title_text="")
+    fig.add_annotation(
+        text=f"Percentage of {stage_name} respondents",
+        xref="paper",
+        yref="paper",
+        x=-0.055,
+        y=0.5,
+        showarrow=False,
+        textangle=-90,
+        font=dict(size=14, color="#4b5563")
+    )
     fig.for_each_annotation(lambda a: a.update(text=a.text.replace("task=", "")))
     return fig
 
@@ -525,6 +621,122 @@ def make_stage_summary_by_group(df, stage_name, tasks, group_col):
         summary["group_n_stage_respondents"] = n_answered
         records.append(summary)
     return pd.concat(records, ignore_index=True) if records else pd.DataFrame()
+
+
+def make_tool_category_stage_summary(df, group_col=None):
+    """
+    Summarises each EdTech product category across all teaching journey stages.
+
+    For each stage and tool category, the numerator is the number of respondents who
+    selected that tool category for at least one task in that stage. The denominator is
+    the number of respondents who selected at least one tool-use option in that stage.
+    This makes it easier to see where each product category is most used across the
+    teaching journey.
+    """
+    records = []
+
+    if group_col is None:
+        grouped_data = [("All respondents", df)]
+    else:
+        grouped_data = [
+            ("Missing" if pd.isna(group_value) else str(group_value), group_df)
+            for group_value, group_df in df.groupby(group_col, dropna=False)
+        ]
+
+    for group_label, group_df in grouped_data:
+        for stage_name, tasks in stage_tasks.items():
+            stage_matrix_cols = []
+            tool_cols_by_tool = {}
+
+            for task_label, task_stem in tasks.items():
+                for tool_label, tool_key in tool_specs.items():
+                    col = find_matrix_col(group_df, task_stem, tool_key)
+                    if col is None:
+                        continue
+                    stage_matrix_cols.append(col)
+                    tool_cols_by_tool.setdefault(tool_label, []).append(col)
+
+            if len(stage_matrix_cols) == 0:
+                continue
+
+            answered_stage = (group_df[stage_matrix_cols].notna() & (group_df[stage_matrix_cols] != 0)).any(axis=1)
+            n_stage = int(answered_stage.sum())
+
+            for tool_label, tool_cols in tool_cols_by_tool.items():
+                used_tool_in_stage = (group_df[tool_cols].notna() & (group_df[tool_cols] != 0)).any(axis=1)
+                count = int((answered_stage & used_tool_in_stage).sum())
+                percent = count / n_stage * 100 if n_stage > 0 else 0
+
+                records.append({
+                    "group_value": group_label,
+                    "stage": stage_name,
+                    "tool_type": tool_label,
+                    "count": count,
+                    "n_stage_respondents": n_stage,
+                    "percent_stage_respondents": percent
+                })
+
+    return pd.DataFrame(records)
+
+
+def plot_tool_category_across_stages(summary, selected_tool=None, chart_type="Line chart"):
+    plot_df = summary.copy()
+    stage_order = list(stage_tasks.keys())
+    plot_df["stage"] = pd.Categorical(plot_df["stage"], categories=stage_order, ordered=True)
+    plot_df = plot_df.sort_values(["tool_type", "stage"])
+
+    if selected_tool is not None and selected_tool != "All categories":
+        plot_df = plot_df[plot_df["tool_type"] == selected_tool].copy()
+
+    if chart_type == "Heatmap":
+        if selected_tool is not None and selected_tool != "All categories" and plot_df["group_value"].nunique() > 1:
+            heatmap_data = plot_df.pivot(index="group_value", columns="stage", values="percent_stage_respondents").fillna(0)
+            y_label = "Segment"
+            title = f"{selected_tool}: Use Across Teaching Journey Stages by Segment"
+        else:
+            heatmap_data = plot_df.pivot(index="tool_type", columns="stage", values="percent_stage_respondents").fillna(0)
+            y_label = "EdTech Product Category"
+            title = "EdTech Product Category Use Across Teaching Journey Stages"
+
+        fig = px.imshow(
+            heatmap_data,
+            text_auto=".1f",
+            aspect="auto",
+            title=title,
+            labels={"x": "Teaching Journey Stage", "y": y_label, "color": "% of Stage Respondents"}
+        )
+        fig.update_layout(template="plotly_white", height=600, margin=dict(t=80, b=80, l=260, r=40))
+        fig.update_xaxes(tickangle=-25)
+        return fig
+
+    if plot_df["group_value"].nunique() > 1 and selected_tool is not None and selected_tool != "All categories":
+        fig = px.line(
+            plot_df,
+            x="stage",
+            y="percent_stage_respondents",
+            color="group_value",
+            markers=True,
+            title=f"{selected_tool}: Use Across Teaching Journey Stages by Segment",
+            labels={"stage": "Teaching Journey Stage", "percent_stage_respondents": "% of Stage Respondents", "group_value": "Segment"},
+            custom_data=["count", "n_stage_respondents"]
+        )
+    else:
+        fig = px.line(
+            plot_df,
+            x="stage",
+            y="percent_stage_respondents",
+            color="tool_type",
+            markers=True,
+            title="EdTech Product Category Use Across Teaching Journey Stages",
+            labels={"stage": "Teaching Journey Stage", "percent_stage_respondents": "% of Stage Respondents", "tool_type": "EdTech Product Category"},
+            custom_data=["count", "n_stage_respondents"]
+        )
+
+    fig.update_traces(
+        hovertemplate="<b>%{x}</b><br>Percentage: %{y:.1f}%<br>Count: %{customdata[0]}<br>Stage respondents: %{customdata[1]}<extra></extra>"
+    )
+    fig.update_layout(template="plotly_white", height=650, xaxis_tickangle=-25, yaxis=dict(range=[0, 100]))
+    return fig
 
 
 def plot_tool_use_by_group(group_summary, stage_name, group_label, chart_type="Faceted grouped bar chart"):
@@ -922,25 +1134,27 @@ def add_multiselect_yes_no_columns(df, adoption_cols):
 # File uploader and settings
 # ============================================================
 
-# Show the upload prompt only before a file is uploaded. Once a file is present,
-# the upload section is removed so the dashboard starts with the client-facing tabs.
-upload_placeholder = st.empty()
-
-with upload_placeholder.container():
-    with tab_profile:
+# The section navigation is already visible at the top. The upload control is
+# shown inside the Executive Overview tab only until a file is selected.
+with tab_profile:
+    upload_placeholder = st.empty()
+    with upload_placeholder.container():
         st.markdown("### Upload Campion survey export")
         uploaded_file = st.file_uploader(
             "Upload the Excel survey file",
             type=["xlsx", "xls"],
-            help="Upload the raw Excel export. The dashboard will clean the two-header structure automatically."
+            help="Upload the raw Excel export. The dashboard will clean the two-header structure automatically.",
+            key="campion_survey_upload"
         )
 
 if uploaded_file is None:
     with tab_profile:
         st.info("Upload the Campion EdTech Adoption survey file to generate the dashboard.")
     st.stop()
-else:
-    upload_placeholder.empty()
+
+# Remove the uploader from view after upload, while keeping the uploaded file in memory
+# for the current Streamlit rerun.
+upload_placeholder.empty()
 
 with st.sidebar:
     st.header("Dashboard Controls")
@@ -977,6 +1191,7 @@ data_clean, raw, dropped_cols = clean_two_header_excel(
 # ============================================================
 
 role_col = find_first_existing_col(data_clean, [
+    "what_best_describes_your_primary_roleselect_the_most_senior_role_that_applies_to_you_response",
     "which_of_the_following_best_describes_your_role_select_one_response",
     "which_of_the_following_best_describes_your_role",
     "role"
@@ -984,8 +1199,21 @@ role_col = find_first_existing_col(data_clean, [
 if role_col is None:
     role_col = find_best_column(data_clean, include_terms=["role"], exclude_terms=["email", "name"])
 
-confidence_matches = find_column_by_keywords(data_clean, include_terms=["confidence"])
-confidence_col = confidence_matches[0] if confidence_matches else None
+confidence_col = find_first_existing_col(data_clean, [
+    "how_would_you_describe_your_overall_confidence_in_using_educational_technology_in_your_teachingselect_one_response"
+])
+if confidence_col is None:
+    confidence_col = find_best_column(
+        data_clean,
+        include_terms=["overall", "confidence", "educational", "technology"],
+        exclude_terms=["barrier", "gap", "skills", "professional"]
+    )
+if confidence_col is None:
+    confidence_matches = [
+        col for col in find_column_by_keywords(data_clean, include_terms=["confidence"])
+        if "barrier" not in col and "gap" not in col and "skills" not in col and "professional" not in col
+    ]
+    confidence_col = confidence_matches[0] if confidence_matches else None
 
 school_sector_col = find_first_existing_col(data_clean, [
     "what_is_your_school_sectorselect_one_what_is_your_school_sectorselect_one"
@@ -1061,33 +1289,48 @@ with tab_profile:
     )
 
     st.subheader("Respondent profile")
-    profile_col1, profile_col2 = st.columns(2)
-    with profile_col1:
-        if role_col:
-            fig = plot_categorical_variable(
-                data_clean,
-                role_col,
-                title="Respondent Roles in the Campion EdTech Adoption Survey",
-                x_title="Role",
-                chart_type=profile_chart_type,
-                horizontal=True
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.warning("Could not detect respondent role column.")
-    with profile_col2:
-        if confidence_col:
-            fig = plot_categorical_variable(
-                data_clean,
-                confidence_col,
-                title="Current EdTech Confidence Among Respondents",
-                x_title="Confidence Level",
-                chart_type=profile_chart_type,
-                horizontal=False
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.warning("Could not detect confidence column.")
+    if role_col:
+        fig = plot_categorical_variable(
+            data_clean,
+            role_col,
+            title="Respondent Roles in the Campion EdTech Adoption Survey",
+            x_title="Role",
+            chart_type=profile_chart_type,
+            horizontal=True,
+            sort_by_value=False,
+            wrap_labels=True,
+            label_width=46
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.warning("Could not detect respondent role column.")
+
+    if confidence_col:
+        confidence_order = order_categories_by_keywords(
+            data_clean[confidence_col],
+            keyword_order=[
+                ["lead", "champion"],
+                ["very", "confident"],
+                ["confident", "regularly"],
+                ["somewhat", "comfortable"],
+                ["not", "confident"],
+            ]
+        )
+        fig = plot_categorical_variable(
+            data_clean,
+            confidence_col,
+            title="Current EdTech Confidence Among Respondents",
+            x_title="Confidence Level",
+            chart_type=profile_chart_type,
+            horizontal=True,
+            category_order=confidence_order,
+            sort_by_value=False,
+            wrap_labels=True,
+            label_width=46
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.warning("Could not detect confidence column.")
 
     st.subheader("School profile")
     school_col1, school_col2 = st.columns(2)
@@ -1099,7 +1342,8 @@ with tab_profile:
                     school_sector_col,
                     title="School Sector Representation",
                     x_title="School Sector",
-                    chart_type=profile_chart_type
+                    chart_type=profile_chart_type,
+                    sort_by_value=False
                 ),
                 use_container_width=True
             )
@@ -1110,7 +1354,8 @@ with tab_profile:
                     students_enrolled_col,
                     title="School Size by Student Enrolment",
                     x_title="Students Enrolled",
-                    chart_type=profile_chart_type
+                    chart_type=profile_chart_type,
+                    sort_by_value=False
                 ),
                 use_container_width=True
             )
@@ -1122,7 +1367,8 @@ with tab_profile:
                     school_type_col,
                     title="School Type Representation",
                     x_title="School Type",
-                    chart_type=profile_chart_type
+                    chart_type=profile_chart_type,
+                    sort_by_value=False
                 ),
                 use_container_width=True
             )
@@ -1134,7 +1380,8 @@ with tab_profile:
                     title="State and Territory Representation",
                     x_title="State or Territory",
                     chart_type=profile_chart_type,
-                    horizontal=True
+                    horizontal=True,
+                    sort_by_value=False
                 ),
                 use_container_width=True
             )
@@ -1154,20 +1401,32 @@ with tab_tool_use:
 
     tool_chart_type = st.selectbox(
         "Choose view",
-        ["Detailed task view", "Heatmap summary", "Grouped comparison"],
+        ["Detailed task view", "Stage heatmap"],
         index=0,
         key="tool_chart_type"
     )
 
+    profile_split_options = {"No split": None}
+    for label in ["School Sector", "School Type", "Students Enrolled", "State or Territory"]:
+        if label in available_profile_vars:
+            profile_split_options[label] = available_profile_vars[label]
+
+    split_label = st.selectbox(
+        "Split current EdTech use by",
+        list(profile_split_options.keys()),
+        index=0,
+        key="current_use_split_label"
+    )
+    split_col = profile_split_options[split_label]
+
+    all_stage_summaries = {}
+    all_missing = []
     selected_stages = st.multiselect(
         "Select teaching journey stages",
         options=list(stage_tasks.keys()),
         default=list(stage_tasks.keys()),
         key="selected_stages_tool_page"
     )
-
-    all_stage_summaries = {}
-    all_missing = []
 
     for stage_name in selected_stages:
         summary, missing_df, n_answered = make_stage_summary(data_clean, stage_name, stage_tasks[stage_name])
@@ -1179,21 +1438,35 @@ with tab_tool_use:
             continue
 
         if stage_name == "Assessment":
-            facet_wrap, height = 3, 1000
+            facet_wrap, height = 3, 1050
         elif stage_name in ["Planning", "Monitoring and Progress", "Wellbeing"]:
-            facet_wrap, height = 3, 650
+            facet_wrap, height = 3, 700
         else:
-            facet_wrap, height = 2, 800
+            facet_wrap, height = 2, 900
 
         st.subheader(stage_name)
         st.caption(f"{n_answered} respondents selected at least one option in this stage.")
 
-        if tool_chart_type == "Detailed task view":
+        if split_col is not None:
+            group_summary = make_stage_summary_by_group(
+                data_clean,
+                stage_name=stage_name,
+                tasks=stage_tasks[stage_name],
+                group_col=split_col
+            )
+            if group_summary.empty:
+                st.warning(f"Could not create split view for {stage_name} by {split_label}.")
+                continue
+            fig = plot_tool_use_by_group(
+                group_summary,
+                stage_name=stage_name,
+                group_label=split_label,
+                chart_type="Heatmap" if tool_chart_type == "Stage heatmap" else "Faceted grouped bar chart"
+            )
+        elif tool_chart_type == "Detailed task view":
             fig = plot_stage_facets(summary, stage_name=stage_name, facet_wrap=facet_wrap, height=height)
-        elif tool_chart_type == "Heatmap summary":
-            fig = plot_stage_heatmap(summary, stage_name=stage_name)
         else:
-            fig = plot_stage_grouped_bar(summary, stage_name=stage_name)
+            fig = plot_stage_heatmap(summary, stage_name=stage_name)
         st.plotly_chart(fig, use_container_width=True)
 
     if show_admin_details:
@@ -1261,101 +1534,92 @@ with tab_adoption:
 
     adoption_cols = get_school_adoption_columns(data_clean)
 
-    adoption_view = st.selectbox(
-        "Choose adoption insight",
-        [
-            "Near-term expansion plans",
-            "Priority teaching journey areas",
-            "Priority product categories",
-            "Planned training and policy support",
-            "Key barriers to adoption",
-            "Policy maturity",
-            "Generative AI capability",
-            "Expected change in GenAI use"
-        ],
-        key="adoption_view"
-    )
-
     adoption_chart_type = st.selectbox(
-        "Choose view",
-        ["Bar chart", "Heatmap", "Stacked bar"],
+        "Choose view for scaled-response insights",
+        ["Bar chart", "Heatmap"],
         key="adoption_chart_type"
     )
 
-    if adoption_view == "Near-term expansion plans":
-        col = adoption_cols["expand_next_12_months"]
-        if col is None or col not in data_clean.columns:
-            st.warning("Could not find the expansion plans column.")
-        else:
-            fig = plot_categorical_variable(
-                data_clean,
-                col,
-                title="Near-Term Plans to Develop or Expand EdTech Use",
-                x_title="Response",
-                chart_type="Bar - Percentage",
-                horizontal=True
-            )
-            st.plotly_chart(fig, use_container_width=True)
+    st.subheader("Near-term expansion plans")
+    col = adoption_cols["expand_next_12_months"]
+    if col is None or col not in data_clean.columns:
+        st.warning("Could not find the expansion plans column.")
+    else:
+        fig = plot_categorical_variable(
+            data_clean,
+            col,
+            title="Near-Term Plans to Develop or Expand EdTech Use",
+            x_title="Response",
+            chart_type="Bar - Percentage",
+            horizontal=True,
+            sort_by_value=False,
+            wrap_labels=True,
+            label_width=44
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
-    elif adoption_view == "Priority teaching journey areas":
-        likert_df = make_likert_long(data_clean, adoption_cols["journey_interest"], value_order=interest_order)
-        if likert_df.empty:
-            st.warning("Could not create teaching journey priority chart.")
-        else:
-            fig = plot_likert_heatmap(likert_df, "Priority Areas for EdTech Expansion") if adoption_chart_type == "Heatmap" else plot_likert_stacked_bar(likert_df, "Priority Areas for EdTech Expansion")
-            st.plotly_chart(fig, use_container_width=True)
+    st.subheader("Priority teaching journey areas")
+    likert_df = make_likert_long(data_clean, adoption_cols["journey_interest"], value_order=interest_order)
+    if likert_df.empty:
+        st.warning("Could not create teaching journey priority chart.")
+    else:
+        fig = plot_likert_heatmap(likert_df, "Priority Areas for EdTech Expansion") if adoption_chart_type == "Heatmap" else plot_likert_stacked_bar(likert_df, "Priority Areas for EdTech Expansion")
+        st.plotly_chart(fig, use_container_width=True)
 
-    elif adoption_view == "Priority product categories":
-        likert_df = make_likert_long(data_clean, adoption_cols["tool_interest"], value_order=interest_order)
-        if likert_df.empty:
-            st.warning("Could not create product category priority chart.")
-        else:
-            fig = plot_likert_heatmap(likert_df, "Priority EdTech Product Categories for Adoption or Expansion") if adoption_chart_type == "Heatmap" else plot_likert_stacked_bar(likert_df, "Priority EdTech Product Categories for Adoption or Expansion")
-            st.plotly_chart(fig, use_container_width=True)
+    st.subheader("Priority product categories")
+    likert_df = make_likert_long(data_clean, adoption_cols["tool_interest"], value_order=interest_order)
+    if likert_df.empty:
+        st.warning("Could not create product category priority chart.")
+    else:
+        fig = plot_likert_heatmap(likert_df, "Priority EdTech Product Categories for Adoption or Expansion") if adoption_chart_type == "Heatmap" else plot_likert_stacked_bar(likert_df, "Priority EdTech Product Categories for Adoption or Expansion")
+        st.plotly_chart(fig, use_container_width=True)
 
-    elif adoption_view == "Planned training and policy support":
-        summary = make_multiselect_summary(data_clean, adoption_cols["training_policy"])
-        if summary.empty:
-            st.warning("Could not create training and policy support chart.")
-        else:
-            st.plotly_chart(plot_multiselect_bar(summary, "Planned Training and Policy Support for Expansion"), use_container_width=True)
+    st.subheader("Planned training and policy support")
+    summary = make_multiselect_summary(data_clean, adoption_cols["training_policy"])
+    if summary.empty:
+        st.warning("Could not create training and policy support chart.")
+    else:
+        st.plotly_chart(plot_multiselect_bar(summary, "Planned Training and Policy Support for Expansion"), use_container_width=True)
 
-    elif adoption_view == "Key barriers to adoption":
-        summary = make_multiselect_summary(data_clean, adoption_cols["barriers"])
-        if summary.empty:
-            st.warning("Could not create barriers chart.")
-        else:
-            st.plotly_chart(plot_multiselect_bar(summary, "Key Barriers to EdTech and Generative AI Adoption"), use_container_width=True)
+    st.subheader("Key barriers to adoption")
+    summary = make_multiselect_summary(data_clean, adoption_cols["barriers"])
+    if summary.empty:
+        st.warning("Could not create barriers chart.")
+    else:
+        st.plotly_chart(plot_multiselect_bar(summary, "Key Barriers to EdTech and Generative AI Adoption"), use_container_width=True)
 
-    elif adoption_view == "Policy maturity":
-        summary = make_multiselect_summary(data_clean, adoption_cols["formal_policies"])
-        if summary.empty:
-            st.warning("Could not create policy maturity chart.")
-        else:
-            st.plotly_chart(plot_multiselect_bar(summary, "Formal Policies Covering EdTech and AI"), use_container_width=True)
+    st.subheader("Policy maturity")
+    summary = make_multiselect_summary(data_clean, adoption_cols["formal_policies"])
+    if summary.empty:
+        st.warning("Could not create policy maturity chart.")
+    else:
+        st.plotly_chart(plot_multiselect_bar(summary, "Formal Policies Covering EdTech and AI"), use_container_width=True)
 
-    elif adoption_view == "Generative AI capability":
-        likert_df = make_likert_long(data_clean, adoption_cols["genai_proficiency"], value_order=proficiency_order)
-        if likert_df.empty:
-            st.warning("Could not create GenAI capability chart.")
-        else:
-            fig = plot_likert_heatmap(likert_df, "Current Generative AI Capability Across Key Areas") if adoption_chart_type == "Heatmap" else plot_likert_stacked_bar(likert_df, "Current Generative AI Capability Across Key Areas")
-            st.plotly_chart(fig, use_container_width=True)
+    st.subheader("Generative AI capability")
+    likert_df = make_likert_long(data_clean, adoption_cols["genai_proficiency"], value_order=proficiency_order)
+    if likert_df.empty:
+        st.warning("Could not create GenAI capability chart.")
+    else:
+        fig = plot_likert_heatmap(likert_df, "Current Generative AI Capability Across Key Areas") if adoption_chart_type == "Heatmap" else plot_likert_stacked_bar(likert_df, "Current Generative AI Capability Across Key Areas")
+        st.plotly_chart(fig, use_container_width=True)
 
-    elif adoption_view == "Expected change in GenAI use":
-        col = adoption_cols["future_genai_use"]
-        if col is None or col not in data_clean.columns:
-            st.warning("Could not find the future GenAI use column.")
-        else:
-            fig = plot_categorical_variable(
-                data_clean,
-                col,
-                title="Expected Change in Generative AI Use Over the Next 12 Months",
-                x_title="Expected Change",
-                chart_type="Bar - Percentage",
-                horizontal=True
-            )
-            st.plotly_chart(fig, use_container_width=True)
+    st.subheader("Expected change in GenAI use")
+    col = adoption_cols["future_genai_use"]
+    if col is None or col not in data_clean.columns:
+        st.warning("Could not find the future GenAI use column.")
+    else:
+        fig = plot_categorical_variable(
+            data_clean,
+            col,
+            title="Expected Change in Generative AI Use Over the Next 12 Months",
+            x_title="Expected Change",
+            chart_type="Bar - Percentage",
+            horizontal=True,
+            sort_by_value=False,
+            wrap_labels=True,
+            label_width=44
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
 
 # ============================================================
@@ -1365,150 +1629,531 @@ with tab_adoption:
 with tab_interactions:
     st.header("Strategic Segments")
     st.write(
-        "Use this section to identify how EdTech adoption, satisfaction, readiness, and barriers differ across "
-        "school and respondent segments. These views are useful for identifying priority segments, support needs, "
-        "and product opportunities."
+        "Use this section to compare how EdTech use, satisfaction, adoption priorities, and readiness vary across "
+        "school and respondent segments. The options are intentionally focused so the comparisons remain interpretable."
     )
 
-    if len(available_profile_vars) == 0 and len(available_adoption_vars) == 0:
-        st.warning("Not enough variables were detected to create interaction charts.")
-    else:
-        interaction_type = st.selectbox(
-            "Choose segmentation analysis",
-            [
-                "School/respondent profile comparison",
-                "Profile by adoption readiness",
-                "Adoption readiness comparison",
-                "Profile by current EdTech use",
-                "Adoption readiness by current EdTech use",
-                "Profile by satisfaction",
-                "Adoption readiness by satisfaction"
-            ],
-            key="interaction_type"
+    segment_data = data_for_interactions.copy()
+
+    # ------------------------------------------------------------
+    # Build demographic split options
+    # ------------------------------------------------------------
+    demographic_split_options = {"No split": None}
+    for label, col in available_profile_vars.items():
+        if col is not None and col in segment_data.columns:
+            demographic_split_options[label] = col
+
+    # ------------------------------------------------------------
+    # Task-level usage profile, matching the client reference chart logic
+    # ------------------------------------------------------------
+    def make_task_level_tool_usage(df, split_col=None, min_group_n=1):
+        """
+        Create task-level usage percentages for each EdTech product category.
+
+        This matches the reference graph logic:
+        - For each teaching-journey task and product category, calculate the percentage
+          of stage respondents who selected that product category for that task.
+        - The box/range charts then summarise the spread of those task-level percentages.
+
+        This is different from respondent-level usage intensity.
+        """
+        records = []
+
+        if split_col is None:
+            grouped_frames = [("All respondents", df)]
+        else:
+            grouped_frames = []
+            for group_value, group_df in df.groupby(split_col, dropna=False):
+                group_label = "Missing" if pd.isna(group_value) else str(group_value)
+                if len(group_df) >= min_group_n:
+                    grouped_frames.append((group_label, group_df))
+
+        for segment_label, group_df in grouped_frames:
+            for stage_name, tasks in stage_tasks.items():
+                stage_summary, _, n_answered = make_stage_summary(group_df, stage_name, tasks)
+                if stage_summary.empty:
+                    continue
+
+                temp = stage_summary.copy()
+                temp["segment"] = segment_label
+                temp["stage"] = stage_name
+                temp["task_stage_label"] = temp["stage"] + ": " + temp["task"]
+                temp["usage_percent"] = temp["percent_stage_respondents"]
+                temp["segment_stage_respondents"] = n_answered
+                records.append(temp[[
+                    "segment",
+                    "stage",
+                    "task",
+                    "task_stage_label",
+                    "tool_type",
+                    "usage_percent",
+                    "count",
+                    "segment_stage_respondents"
+                ]])
+
+        return pd.concat(records, ignore_index=True) if records else pd.DataFrame()
+
+    def plot_task_usage_boxplot(task_usage_df, split_label, split_col=None):
+        if split_col is None:
+            fig = px.box(
+                task_usage_df,
+                x="usage_percent",
+                y="tool_type",
+                color="tool_type",
+                points="all",
+                orientation="h",
+                title="Distribution of Task-Level EdTech Product Category Usage",
+                labels={
+                    "usage_percent": "Task-level usage (%)",
+                    "tool_type": "EdTech Product Category"
+                },
+                color_discrete_map=color_map,
+                custom_data=["task_stage_label", "count", "segment_stage_respondents"]
+            )
+            legend_title = "EdTech Product Category"
+        else:
+            fig = px.box(
+                task_usage_df,
+                x="usage_percent",
+                y="tool_type",
+                color="segment",
+                points="all",
+                orientation="h",
+                title=f"Distribution of Task-Level EdTech Product Category Usage by {split_label}",
+                labels={
+                    "usage_percent": "Task-level usage (%)",
+                    "tool_type": "EdTech Product Category",
+                    "segment": split_label
+                },
+                custom_data=["task_stage_label", "count", "segment_stage_respondents"]
+            )
+            legend_title = split_label
+
+        fig.update_traces(
+            boxmean=False,
+            jitter=0.35,
+            pointpos=0,
+            marker=dict(size=6, opacity=0.65),
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "Task: %{customdata[0]}<br>"
+                "Usage: %{x:.1f}%<br>"
+                "Respondents selecting this option: %{customdata[1]}<br>"
+                "Stage respondents: %{customdata[2]}"
+                "<extra></extra>"
+            )
+        )
+        fig.update_layout(
+            template="plotly_white",
+            height=max(650, 135 * task_usage_df["tool_type"].nunique()),
+            xaxis=dict(range=[-2, 102], ticksuffix="%"),
+            margin=dict(t=90, b=80, l=280, r=40),
+            legend_title=legend_title
+        )
+        return fig
+
+    def plot_task_usage_range(task_usage_df, split_label, split_col=None, show_median=True):
+        summary = task_usage_df.groupby(["tool_type", "segment"], as_index=False).agg(
+            min_usage=("usage_percent", "min"),
+            max_usage=("usage_percent", "max"),
+            median_usage=("usage_percent", "median"),
+            n_tasks=("usage_percent", "count")
+        )
+        summary["range_width"] = summary["max_usage"] - summary["min_usage"]
+        summary["median_label"] = summary["median_usage"].round(1).astype(str) + "%"
+
+        if split_col is None:
+            fig = px.bar(
+                summary,
+                x="range_width",
+                y="tool_type",
+                base="min_usage",
+                color="tool_type",
+                orientation="h",
+                title="Task-Level Usage Range by EdTech Product Category" if show_median else "Task-Level Usage Range by EdTech Product Category — Range Only",
+                labels={
+                    "range_width": "Task-level usage range (%)",
+                    "tool_type": "EdTech Product Category"
+                },
+                color_discrete_map=color_map,
+                custom_data=["min_usage", "max_usage", "median_usage", "n_tasks"]
+            )
+            fig.update_layout(showlegend=False)
+        else:
+            fig = px.bar(
+                summary,
+                x="range_width",
+                y="tool_type",
+                base="min_usage",
+                color="segment",
+                barmode="group",
+                orientation="h",
+                title=f"Task-Level Usage Range by EdTech Product Category and {split_label}" if show_median else f"Task-Level Usage Range by EdTech Product Category and {split_label} — Range Only",
+                labels={
+                    "range_width": "Task-level usage range (%)",
+                    "tool_type": "EdTech Product Category",
+                    "segment": split_label
+                },
+                custom_data=["min_usage", "max_usage", "median_usage", "n_tasks"]
+            )
+
+        fig.update_traces(
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "Min task usage: %{customdata[0]:.1f}%<br>"
+                "Max task usage: %{customdata[1]:.1f}%<br>"
+                "Median task usage: %{customdata[2]:.1f}%<br>"
+                "Tasks included: %{customdata[3]}"
+                "<extra></extra>"
+            )
         )
 
-        if interaction_type == "School/respondent profile comparison":
-            if len(available_profile_vars) < 2:
-                st.warning("At least two profile variables are needed for this interaction.")
-            else:
-                col_a, col_b, col_c = st.columns(3)
-                with col_a:
-                    row_var_label = st.selectbox("Rows", list(available_profile_vars.keys()), index=0, key="row_var_label_profile_profile")
-                with col_b:
-                    col_var_label = st.selectbox("Columns", list(available_profile_vars.keys()), index=min(1, len(available_profile_vars) - 1), key="col_var_label_profile_profile")
-                with col_c:
-                    interaction_chart_type = st.selectbox("Choose view", ["Heatmap", "Grouped bar chart"], key="profile_profile_chart_type")
-                fig = plot_crosstab_percent(
-                    data_for_interactions,
-                    row_col=available_profile_vars[row_var_label],
-                    col_col=available_profile_vars[col_var_label],
-                    row_label=row_var_label,
-                    col_label=col_var_label,
-                    title=f"{row_var_label} × {col_var_label}",
-                    chart_type=interaction_chart_type
+        if show_median:
+            median_trace = go.Scatter(
+                x=summary["median_usage"],
+                y=summary["tool_type"],
+                mode="markers+text",
+                marker=dict(color="black", size=10, symbol="circle"),
+                text=summary["median_label"],
+                textposition="middle right",
+                name="Median",
+                customdata=summary[["segment", "n_tasks"]],
+                hovertemplate=(
+                    "<b>%{y}</b><br>"
+                    "Segment: %{customdata[0]}<br>"
+                    "Median task usage: %{x:.1f}%<br>"
+                    "Tasks included: %{customdata[1]}"
+                    "<extra></extra>"
                 )
-                st.plotly_chart(fig, use_container_width=True)
+            )
+            fig.add_trace(median_trace)
 
-        elif interaction_type == "Profile by adoption readiness":
-            if len(available_profile_vars) == 0 or len(available_adoption_vars) == 0:
-                st.warning("Profile or adoption/readiness variables were not detected.")
-            else:
-                col_a, col_b, col_c = st.columns(3)
-                with col_a:
-                    row_var_label = st.selectbox("Profile variable", list(available_profile_vars.keys()), key="profile_adoption_row")
-                with col_b:
-                    col_var_label = st.selectbox("Adoption/readiness variable", list(available_adoption_vars.keys()), key="profile_adoption_col")
-                with col_c:
-                    interaction_chart_type = st.selectbox("Choose view", ["Heatmap", "Grouped bar chart"], key="profile_adoption_chart_type")
-                fig = plot_crosstab_percent(
-                    data_for_interactions,
-                    row_col=available_profile_vars[row_var_label],
-                    col_col=available_adoption_vars[col_var_label],
-                    row_label=row_var_label,
-                    col_label=col_var_label,
-                    title=f"{row_var_label} × {col_var_label}",
-                    chart_type=interaction_chart_type
-                )
-                st.plotly_chart(fig, use_container_width=True)
+        fig.update_layout(
+            template="plotly_white",
+            height=max(650, 135 * task_usage_df["tool_type"].nunique()),
+            xaxis=dict(range=[0, 105], ticksuffix="%", title="Task-level usage (%)"),
+            margin=dict(t=90, b=80, l=280, r=80),
+            legend_title=split_label if split_col is not None else ("Summary" if show_median else "EdTech Product Category")
+        )
+        return fig
 
-        elif interaction_type == "Adoption readiness comparison":
-            if len(available_adoption_vars) < 2:
-                st.warning("At least two adoption/readiness variables are needed for this interaction.")
-            else:
-                col_a, col_b, col_c = st.columns(3)
-                with col_a:
-                    row_var_label = st.selectbox("Rows", list(available_adoption_vars.keys()), index=0, key="adoption_adoption_row")
-                with col_b:
-                    col_var_label = st.selectbox("Columns", list(available_adoption_vars.keys()), index=min(1, len(available_adoption_vars) - 1), key="adoption_adoption_col")
-                with col_c:
-                    interaction_chart_type = st.selectbox("Choose view", ["Heatmap", "Grouped bar chart"], key="adoption_adoption_chart_type")
-                fig = plot_crosstab_percent(
-                    data_for_interactions,
-                    row_col=available_adoption_vars[row_var_label],
-                    col_col=available_adoption_vars[col_var_label],
-                    row_label=row_var_label,
-                    col_label=col_var_label,
-                    title=f"{row_var_label} × {col_var_label}",
-                    chart_type=interaction_chart_type
-                )
-                st.plotly_chart(fig, use_container_width=True)
+    # ------------------------------------------------------------
+    # Build variable catalogue for other strategic comparisons
+    # ------------------------------------------------------------
+    variable_catalog = []
 
-        elif interaction_type in ["Profile by current EdTech use", "Adoption readiness by current EdTech use"]:
-            use_adoption = interaction_type == "Adoption readiness by current EdTech use"
-            variable_source = available_adoption_vars if use_adoption else available_profile_vars
-            if len(variable_source) == 0:
-                st.warning("No grouping variables were detected.")
+    def add_variable(label, column, section, var_type, role="Both"):
+        if column is not None and column in segment_data.columns:
+            variable_catalog.append({
+                "label": label,
+                "column": column,
+                "section": section,
+                "type": var_type,
+                "role": role
+            })
+
+    for label, col in available_profile_vars.items():
+        add_variable(label, col, "Sample characteristics", "categorical", role="Segment")
+
+    for label, col in available_adoption_vars.items():
+        add_variable(label, col, "Adoption priorities and readiness", "categorical", role="Both")
+
+    q15_cols_for_segments = find_q15_columns(segment_data)
+    satisfaction_score_cols = []
+    for tool_type, col in q15_cols_for_segments.items():
+        if col in segment_data.columns:
+            score_col = f"derived_satisfaction_{clean_column_name(tool_type)}"
+            segment_data[score_col] = segment_data[col].astype(str).str.extract(r"([0-9]+)").astype(float)
+            segment_data.loc[~segment_data[score_col].between(1, 10), score_col] = pd.NA
+            satisfaction_score_cols.append(score_col)
+            add_variable(f"Satisfaction: {tool_type}", score_col, "Satisfaction and value", "numeric", role="Outcome")
+
+    if satisfaction_score_cols:
+        segment_data["derived_average_satisfaction_score"] = segment_data[satisfaction_score_cols].mean(axis=1)
+        add_variable("Average satisfaction score", "derived_average_satisfaction_score", "Satisfaction and value", "numeric", role="Outcome")
+
+    for stage_name, tasks in stage_tasks.items():
+        stage_cols = []
+        for task_label, task_stem in tasks.items():
+            for tool_label, tool_key in tool_specs.items():
+                col = find_matrix_col(segment_data, task_stem, tool_key)
+                if col is not None:
+                    stage_cols.append(col)
+        if stage_cols:
+            stage_any_col = f"derived_current_use_any_{clean_column_name(stage_name)}"
+            stage_count_col = f"derived_current_use_count_{clean_column_name(stage_name)}"
+            segment_data[stage_any_col] = (segment_data[stage_cols].notna() & (segment_data[stage_cols] != 0)).any(axis=1).map({True: "Yes", False: "No"})
+            segment_data[stage_count_col] = (segment_data[stage_cols].notna() & (segment_data[stage_cols] != 0)).sum(axis=1)
+            add_variable(f"Any current use in stage: {stage_name}", stage_any_col, "Current EdTech use", "categorical", role="Both")
+            add_variable(f"Current use intensity: {stage_name}", stage_count_col, "Current EdTech use", "numeric", role="Outcome")
+
+    variable_catalog_df = pd.DataFrame(variable_catalog).drop_duplicates(subset=["label", "column"])
+
+    lens_options = [
+        "EdTech category task-level usage",
+        "School profile → current EdTech use",
+        "School profile → satisfaction and value",
+        "School profile → adoption priorities and readiness",
+        "Current EdTech use → satisfaction and value",
+        "Adoption readiness → current use or satisfaction"
+    ]
+
+    selected_lens = st.selectbox(
+        "Strategic question",
+        lens_options,
+        key="strategic_lens"
+    )
+
+    if selected_lens == "EdTech category task-level usage":
+        st.caption(
+            "This view matches the reference chart logic. For each teaching task, it calculates the percentage of "
+            "stage respondents who selected each EdTech product category. The box plot or range chart then summarises "
+            "the spread of those task-level percentages. Dots represent tasks, not individual respondents."
+        )
+
+        split_col_1, split_col_2, split_col_3, split_col_4 = st.columns([1, 1, 1, 0.8])
+        with split_col_1:
+            split_label = st.selectbox(
+                "Split chart by",
+                list(demographic_split_options.keys()),
+                index=0,
+                key="task_usage_split"
+            )
+        with split_col_2:
+            chart_view = st.selectbox(
+                "Chart view",
+                ["Box plot", "Range with median", "Range only"],
+                index=0,
+                key="task_usage_chart_view"
+            )
+        with split_col_3:
+            selected_tools = st.multiselect(
+                "EdTech product categories",
+                list(tool_specs.keys()),
+                default=list(tool_specs.keys()),
+                key="task_usage_tools"
+            )
+        with split_col_4:
+            min_group_n = st.slider(
+                "Minimum group size",
+                min_value=1,
+                max_value=15,
+                value=3,
+                step=1,
+                key="task_usage_min_group"
+            )
+
+        split_col = demographic_split_options[split_label]
+        task_usage = make_task_level_tool_usage(segment_data, split_col=split_col, min_group_n=min_group_n)
+
+        if selected_tools:
+            task_usage = task_usage[task_usage["tool_type"].isin(selected_tools)].copy()
+
+        if task_usage.empty:
+            st.warning("No task-level usage data was available for the current selection.")
+        else:
+            if chart_view == "Range with median":
+                fig = plot_task_usage_range(task_usage, split_label, split_col=split_col, show_median=True)
+            elif chart_view == "Range only":
+                fig = plot_task_usage_range(task_usage, split_label, split_col=split_col, show_median=False)
             else:
-                col_a, col_b, col_c = st.columns(3)
-                with col_a:
-                    group_var_label = st.selectbox("Group current EdTech use by", list(variable_source.keys()), key=f"tool_group_{interaction_type}")
-                with col_b:
-                    selected_stage = st.selectbox("Teaching journey stage", list(stage_tasks.keys()), key=f"stage_{interaction_type}")
-                with col_c:
-                    tool_interaction_chart_type = st.selectbox("Choose view", ["Faceted grouped bar chart", "Heatmap"], key=f"tool_view_{interaction_type}")
-                group_summary = make_stage_summary_by_group(
-                    data_for_interactions,
-                    stage_name=selected_stage,
-                    tasks=stage_tasks[selected_stage],
-                    group_col=variable_source[group_var_label]
-                )
-                if group_summary.empty:
-                    st.warning("Could not create grouped tool-use summary for this selection.")
-                else:
-                    fig = plot_tool_use_by_group(
-                        group_summary,
-                        stage_name=selected_stage,
-                        group_label=group_var_label,
-                        chart_type=tool_interaction_chart_type
+                fig = plot_task_usage_boxplot(task_usage, split_label, split_col=split_col)
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.caption(
+                "Reading guide: each dot represents one teaching task. The value is the percentage of stage respondents "
+                "who selected that product category for that task. The box/range summarises variation across tasks."
+            )
+
+            if show_admin_details:
+                with st.expander("Admin: task-level usage data"):
+                    st.dataframe(task_usage, use_container_width=True)
+
+    else:
+        if variable_catalog_df.empty:
+            st.warning("Not enough variables were detected to create strategic segment charts.")
+        else:
+            lens_map = {
+                "School profile → current EdTech use": {
+                    "segment_sections": ["Sample characteristics"],
+                    "outcome_sections": ["Current EdTech use"],
+                    "default_chart": "Mean / percentage bar"
+                },
+                "School profile → satisfaction and value": {
+                    "segment_sections": ["Sample characteristics"],
+                    "outcome_sections": ["Satisfaction and value"],
+                    "default_chart": "Mean / percentage bar"
+                },
+                "School profile → adoption priorities and readiness": {
+                    "segment_sections": ["Sample characteristics"],
+                    "outcome_sections": ["Adoption priorities and readiness"],
+                    "default_chart": "Heatmap"
+                },
+                "Current EdTech use → satisfaction and value": {
+                    "segment_sections": ["Current EdTech use"],
+                    "outcome_sections": ["Satisfaction and value"],
+                    "default_chart": "Mean / percentage bar"
+                },
+                "Adoption readiness → current use or satisfaction": {
+                    "segment_sections": ["Adoption priorities and readiness"],
+                    "outcome_sections": ["Current EdTech use", "Satisfaction and value"],
+                    "default_chart": "Heatmap"
+                }
+            }
+            lens = lens_map[selected_lens]
+
+            segment_vars = variable_catalog_df[
+                (variable_catalog_df["type"] == "categorical")
+                & (variable_catalog_df["section"].isin(lens["segment_sections"]))
+            ].copy()
+            outcome_vars = variable_catalog_df[
+                (variable_catalog_df["role"].isin(["Outcome", "Both"]))
+                & (variable_catalog_df["section"].isin(lens["outcome_sections"]))
+            ].copy()
+
+            if segment_vars.empty or outcome_vars.empty:
+                st.warning("This strategic question does not have enough detected variables in the uploaded file.")
+            else:
+                controls_1, controls_2, controls_3 = st.columns([1, 1, 0.8])
+                with controls_1:
+                    segment_label = st.selectbox(
+                        "Compare groups by",
+                        segment_vars["label"].tolist(),
+                        key="strategic_segment_by"
                     )
-                    st.plotly_chart(fig, use_container_width=True)
-                    if show_admin_details:
-                        with st.expander("Admin: grouped tool-use summary"):
-                            st.dataframe(group_summary, use_container_width=True)
+                with controls_2:
+                    outcome_label = st.selectbox(
+                        "Measure",
+                        outcome_vars["label"].tolist(),
+                        key="strategic_outcome"
+                    )
 
-        elif interaction_type in ["Profile by satisfaction", "Adoption readiness by satisfaction"]:
-            use_adoption = interaction_type == "Adoption readiness by satisfaction"
-            variable_source = available_adoption_vars if use_adoption else available_profile_vars
-            q15_cols = find_q15_columns(data_for_interactions)
-            if len(q15_cols) == 0:
-                st.warning("Could not automatically find satisfaction columns.")
-            elif len(variable_source) == 0:
-                st.warning("No grouping variables were detected.")
-            else:
-                group_var_label = st.selectbox("Group satisfaction by", list(variable_source.keys()), key=f"satisfaction_group_{interaction_type}")
-                fig, sat_group_summary = plot_satisfaction_by_group(
-                    data_for_interactions,
-                    group_col=variable_source[group_var_label],
-                    group_label=group_var_label,
-                    q15_cols=q15_cols
-                )
-                if fig is None:
-                    st.warning("Could not create satisfaction segmentation chart.")
+                segment_row = segment_vars[segment_vars["label"] == segment_label].iloc[0]
+                outcome_row = outcome_vars[outcome_vars["label"] == outcome_label].iloc[0]
+                segment_col = segment_row["column"]
+                outcome_col = outcome_row["column"]
+                outcome_type = outcome_row["type"]
+
+                if outcome_type == "numeric":
+                    chart_options = ["Mean / percentage bar", "Distribution spread"]
                 else:
-                    st.plotly_chart(fig, use_container_width=True)
+                    chart_options = ["Heatmap", "Grouped bar"]
+
+                with controls_3:
+                    default_index = chart_options.index(lens["default_chart"]) if lens["default_chart"] in chart_options else 0
+                    chart_choice = st.selectbox(
+                        "Chart type",
+                        chart_options,
+                        index=default_index,
+                        key="strategic_chart_type"
+                    )
+
+                min_group_n = st.slider(
+                    "Minimum responses per displayed group",
+                    min_value=1,
+                    max_value=15,
+                    value=3,
+                    step=1,
+                    help="Small groups are hidden to avoid unstable or misleading comparisons.",
+                    key="strategic_general_min_group"
+                )
+
+                if segment_col == outcome_col:
+                    st.warning("Please choose different variables for the group comparison and the measure.")
+                else:
+                    plot_df = segment_data[[segment_col, outcome_col]].copy()
+                    plot_df[segment_col] = plot_df[segment_col].fillna("Missing")
+
+                    group_sizes = plot_df.groupby(segment_col).size().reset_index(name="group_n")
+                    valid_groups = group_sizes.loc[group_sizes["group_n"] >= min_group_n, segment_col].tolist()
+                    plot_df = plot_df[plot_df[segment_col].isin(valid_groups)].copy()
+
+                    if plot_df.empty:
+                        st.warning("No groups met the minimum response threshold for this comparison.")
+                    elif outcome_type == "numeric":
+                        plot_df[outcome_col] = pd.to_numeric(plot_df[outcome_col], errors="coerce")
+                        plot_df = plot_df.dropna(subset=[outcome_col])
+
+                        if plot_df.empty:
+                            st.warning("No valid numeric data was available for this selection.")
+                        elif chart_choice == "Distribution spread":
+                            fig = px.box(
+                                plot_df,
+                                x=segment_col,
+                                y=outcome_col,
+                                points="all",
+                                title=f"{outcome_label} by {segment_label}",
+                                labels={segment_col: segment_label, outcome_col: outcome_label}
+                            )
+                            fig.update_layout(template="plotly_white", height=650, xaxis_tickangle=-25, margin=dict(t=90, b=120, l=80, r=40))
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            summary = plot_df.groupby(segment_col, as_index=False).agg(
+                                mean_value=(outcome_col, "mean"),
+                                median_value=(outcome_col, "median"),
+                                n=(outcome_col, "count")
+                            )
+                            summary = summary.sort_values("mean_value", ascending=False)
+                            summary["label"] = summary["mean_value"].round(1).astype(str)
+                            fig = px.bar(
+                                summary,
+                                x=segment_col,
+                                y="mean_value",
+                                title=f"{outcome_label} by {segment_label}",
+                                labels={segment_col: segment_label, "mean_value": f"Average {outcome_label}"},
+                                text="label",
+                                custom_data=["median_value", "n"]
+                            )
+                            fig.update_traces(
+                                textposition="outside",
+                                hovertemplate="<b>%{x}</b><br>Mean: %{y:.2f}<br>Median: %{customdata[0]:.2f}<br>Responses: %{customdata[1]}<extra></extra>"
+                            )
+                            fig.update_layout(template="plotly_white", height=650, xaxis_tickangle=-25, margin=dict(t=90, b=120, l=80, r=40))
+                            st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        plot_df[outcome_col] = plot_df[outcome_col].fillna("Missing")
+
+                        if chart_choice == "Grouped bar":
+                            ctab = pd.crosstab(plot_df[segment_col], plot_df[outcome_col], normalize="index") * 100
+                            count_tab = pd.crosstab(plot_df[segment_col], plot_df[outcome_col])
+                            long_df = ctab.reset_index().melt(id_vars=segment_col, var_name=outcome_label, value_name="percent")
+                            count_long = count_tab.reset_index().melt(id_vars=segment_col, var_name=outcome_label, value_name="count")
+                            long_df = long_df.merge(count_long, on=[segment_col, outcome_label], how="left")
+
+                            fig = px.bar(
+                                long_df,
+                                x=segment_col,
+                                y="percent",
+                                color=outcome_label,
+                                barmode="group",
+                                title=f"{outcome_label} by {segment_label}",
+                                labels={segment_col: segment_label, "percent": "% within group", outcome_label: outcome_label},
+                                custom_data=["count"]
+                            )
+                            fig.update_traces(
+                                hovertemplate="<b>%{x}</b><br>Category: %{fullData.name}<br>Percentage: %{y:.1f}%<br>Count: %{customdata[0]}<extra></extra>"
+                            )
+                            fig.update_layout(template="plotly_white", height=650, xaxis_tickangle=-25, margin=dict(t=90, b=120, l=80, r=40))
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            fig = plot_crosstab_percent(
+                                plot_df,
+                                row_col=segment_col,
+                                col_col=outcome_col,
+                                row_label=segment_label,
+                                col_label=outcome_label,
+                                title=f"{outcome_label} by {segment_label}",
+                                chart_type="Heatmap"
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+
                     if show_admin_details:
-                        with st.expander("Admin: satisfaction-by-group summary"):
-                            st.dataframe(sat_group_summary, use_container_width=True)
+                        with st.expander("Admin: strategic segment source data"):
+                            st.dataframe(plot_df, use_container_width=True)
+
+    if show_admin_details:
+        with st.expander("Admin: variables available in Strategic Segments"):
+            st.dataframe(variable_catalog_df, use_container_width=True)
 
 
 # ============================================================
