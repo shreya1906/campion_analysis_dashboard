@@ -2,6 +2,7 @@ import re
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+import plotly.graph_objects as go
 
 # ============================================================
 # Streamlit page setup and client-facing styling
@@ -1628,16 +1629,217 @@ with tab_adoption:
 with tab_interactions:
     st.header("Strategic Segments")
     st.write(
-        "Use this section to test focused cross-section questions, such as whether school context, current use, "
-        "satisfaction, or adoption readiness differ across meaningful respondent and school segments. The controls "
-        "are intentionally constrained so the comparisons remain interpretable."
+        "Use this section to compare how EdTech use, satisfaction, adoption priorities, and readiness vary across "
+        "school and respondent segments. The options are intentionally focused so the comparisons remain interpretable."
     )
 
-    # ------------------------------------------------------------
-    # Build a client-facing variable catalogue
-    # ------------------------------------------------------------
-
     segment_data = data_for_interactions.copy()
+
+    # ------------------------------------------------------------
+    # Build demographic split options
+    # ------------------------------------------------------------
+    demographic_split_options = {"No split": None}
+    for label, col in available_profile_vars.items():
+        if col is not None and col in segment_data.columns:
+            demographic_split_options[label] = col
+
+    # ------------------------------------------------------------
+    # Task-level usage profile, matching the client reference chart logic
+    # ------------------------------------------------------------
+    def make_task_level_tool_usage(df, split_col=None, min_group_n=1):
+        """
+        Create task-level usage percentages for each EdTech product category.
+
+        This matches the reference graph logic:
+        - For each teaching-journey task and product category, calculate the percentage
+          of stage respondents who selected that product category for that task.
+        - The box/range charts then summarise the spread of those task-level percentages.
+
+        This is different from respondent-level usage intensity.
+        """
+        records = []
+
+        if split_col is None:
+            grouped_frames = [("All respondents", df)]
+        else:
+            grouped_frames = []
+            for group_value, group_df in df.groupby(split_col, dropna=False):
+                group_label = "Missing" if pd.isna(group_value) else str(group_value)
+                if len(group_df) >= min_group_n:
+                    grouped_frames.append((group_label, group_df))
+
+        for segment_label, group_df in grouped_frames:
+            for stage_name, tasks in stage_tasks.items():
+                stage_summary, _, n_answered = make_stage_summary(group_df, stage_name, tasks)
+                if stage_summary.empty:
+                    continue
+
+                temp = stage_summary.copy()
+                temp["segment"] = segment_label
+                temp["stage"] = stage_name
+                temp["task_stage_label"] = temp["stage"] + ": " + temp["task"]
+                temp["usage_percent"] = temp["percent_stage_respondents"]
+                temp["segment_stage_respondents"] = n_answered
+                records.append(temp[[
+                    "segment",
+                    "stage",
+                    "task",
+                    "task_stage_label",
+                    "tool_type",
+                    "usage_percent",
+                    "count",
+                    "segment_stage_respondents"
+                ]])
+
+        return pd.concat(records, ignore_index=True) if records else pd.DataFrame()
+
+    def plot_task_usage_boxplot(task_usage_df, split_label, split_col=None):
+        if split_col is None:
+            fig = px.box(
+                task_usage_df,
+                x="usage_percent",
+                y="tool_type",
+                color="tool_type",
+                points="all",
+                orientation="h",
+                title="Distribution of Task-Level EdTech Product Category Usage",
+                labels={
+                    "usage_percent": "Task-level usage (%)",
+                    "tool_type": "EdTech Product Category"
+                },
+                color_discrete_map=color_map,
+                custom_data=["task_stage_label", "count", "segment_stage_respondents"]
+            )
+            legend_title = "EdTech Product Category"
+        else:
+            fig = px.box(
+                task_usage_df,
+                x="usage_percent",
+                y="tool_type",
+                color="segment",
+                points="all",
+                orientation="h",
+                title=f"Distribution of Task-Level EdTech Product Category Usage by {split_label}",
+                labels={
+                    "usage_percent": "Task-level usage (%)",
+                    "tool_type": "EdTech Product Category",
+                    "segment": split_label
+                },
+                custom_data=["task_stage_label", "count", "segment_stage_respondents"]
+            )
+            legend_title = split_label
+
+        fig.update_traces(
+            boxmean=False,
+            jitter=0.35,
+            pointpos=0,
+            marker=dict(size=6, opacity=0.65),
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "Task: %{customdata[0]}<br>"
+                "Usage: %{x:.1f}%<br>"
+                "Respondents selecting this option: %{customdata[1]}<br>"
+                "Stage respondents: %{customdata[2]}"
+                "<extra></extra>"
+            )
+        )
+        fig.update_layout(
+            template="plotly_white",
+            height=max(650, 135 * task_usage_df["tool_type"].nunique()),
+            xaxis=dict(range=[-2, 102], ticksuffix="%"),
+            margin=dict(t=90, b=80, l=280, r=40),
+            legend_title=legend_title
+        )
+        return fig
+
+    def plot_task_usage_range(task_usage_df, split_label, split_col=None, show_median=True):
+        summary = task_usage_df.groupby(["tool_type", "segment"], as_index=False).agg(
+            min_usage=("usage_percent", "min"),
+            max_usage=("usage_percent", "max"),
+            median_usage=("usage_percent", "median"),
+            n_tasks=("usage_percent", "count")
+        )
+        summary["range_width"] = summary["max_usage"] - summary["min_usage"]
+        summary["median_label"] = summary["median_usage"].round(1).astype(str) + "%"
+
+        if split_col is None:
+            fig = px.bar(
+                summary,
+                x="range_width",
+                y="tool_type",
+                base="min_usage",
+                color="tool_type",
+                orientation="h",
+                title="Task-Level Usage Range by EdTech Product Category" if show_median else "Task-Level Usage Range by EdTech Product Category — Range Only",
+                labels={
+                    "range_width": "Task-level usage range (%)",
+                    "tool_type": "EdTech Product Category"
+                },
+                color_discrete_map=color_map,
+                custom_data=["min_usage", "max_usage", "median_usage", "n_tasks"]
+            )
+            fig.update_layout(showlegend=False)
+        else:
+            fig = px.bar(
+                summary,
+                x="range_width",
+                y="tool_type",
+                base="min_usage",
+                color="segment",
+                barmode="group",
+                orientation="h",
+                title=f"Task-Level Usage Range by EdTech Product Category and {split_label}" if show_median else f"Task-Level Usage Range by EdTech Product Category and {split_label} — Range Only",
+                labels={
+                    "range_width": "Task-level usage range (%)",
+                    "tool_type": "EdTech Product Category",
+                    "segment": split_label
+                },
+                custom_data=["min_usage", "max_usage", "median_usage", "n_tasks"]
+            )
+
+        fig.update_traces(
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "Min task usage: %{customdata[0]:.1f}%<br>"
+                "Max task usage: %{customdata[1]:.1f}%<br>"
+                "Median task usage: %{customdata[2]:.1f}%<br>"
+                "Tasks included: %{customdata[3]}"
+                "<extra></extra>"
+            )
+        )
+
+        if show_median:
+            median_trace = go.Scatter(
+                x=summary["median_usage"],
+                y=summary["tool_type"],
+                mode="markers+text",
+                marker=dict(color="black", size=10, symbol="circle"),
+                text=summary["median_label"],
+                textposition="middle right",
+                name="Median",
+                customdata=summary[["segment", "n_tasks"]],
+                hovertemplate=(
+                    "<b>%{y}</b><br>"
+                    "Segment: %{customdata[0]}<br>"
+                    "Median task usage: %{x:.1f}%<br>"
+                    "Tasks included: %{customdata[1]}"
+                    "<extra></extra>"
+                )
+            )
+            fig.add_trace(median_trace)
+
+        fig.update_layout(
+            template="plotly_white",
+            height=max(650, 135 * task_usage_df["tool_type"].nunique()),
+            xaxis=dict(range=[0, 105], ticksuffix="%", title="Task-level usage (%)"),
+            margin=dict(t=90, b=80, l=280, r=80),
+            legend_title=split_label if split_col is not None else ("Summary" if show_median else "EdTech Product Category")
+        )
+        return fig
+
+    # ------------------------------------------------------------
+    # Build variable catalogue for other strategic comparisons
+    # ------------------------------------------------------------
     variable_catalog = []
 
     def add_variable(label, column, section, var_type, role="Both"):
@@ -1650,15 +1852,12 @@ with tab_interactions:
                 "role": role
             })
 
-    # Sample characteristics
     for label, col in available_profile_vars.items():
         add_variable(label, col, "Sample characteristics", "categorical", role="Segment")
 
-    # Adoption and readiness variables
     for label, col in available_adoption_vars.items():
         add_variable(label, col, "Adoption priorities and readiness", "categorical", role="Both")
 
-    # Satisfaction variables from Q15: numeric outcomes
     q15_cols_for_segments = find_q15_columns(segment_data)
     satisfaction_score_cols = []
     for tool_type, col in q15_cols_for_segments.items():
@@ -1673,7 +1872,6 @@ with tab_interactions:
         segment_data["derived_average_satisfaction_score"] = segment_data[satisfaction_score_cols].mean(axis=1)
         add_variable("Average satisfaction score", "derived_average_satisfaction_score", "Satisfaction and value", "numeric", role="Outcome")
 
-    # Current EdTech use: respondent-level stage and product-category indicators
     for stage_name, tasks in stage_tasks.items():
         stage_cols = []
         for task_label, task_stem in tasks.items():
@@ -1689,240 +1887,273 @@ with tab_interactions:
             add_variable(f"Any current use in stage: {stage_name}", stage_any_col, "Current EdTech use", "categorical", role="Both")
             add_variable(f"Current use intensity: {stage_name}", stage_count_col, "Current EdTech use", "numeric", role="Outcome")
 
-    for tool_label, tool_key in tool_specs.items():
-        tool_cols = []
-        for stage_name, tasks in stage_tasks.items():
-            for task_label, task_stem in tasks.items():
-                col = find_matrix_col(segment_data, task_stem, tool_key)
-                if col is not None:
-                    tool_cols.append(col)
-        if tool_cols:
-            tool_any_col = f"derived_current_use_any_{clean_column_name(tool_label)}"
-            tool_count_col = f"derived_current_use_count_{clean_column_name(tool_label)}"
-            segment_data[tool_any_col] = (segment_data[tool_cols].notna() & (segment_data[tool_cols] != 0)).any(axis=1).map({True: "Yes", False: "No"})
-            segment_data[tool_count_col] = (segment_data[tool_cols].notna() & (segment_data[tool_cols] != 0)).sum(axis=1)
-            add_variable(f"Any current use of: {tool_label}", tool_any_col, "Current EdTech use", "categorical", role="Both")
-            add_variable(f"Current use intensity: {tool_label}", tool_count_col, "Current EdTech use", "numeric", role="Outcome")
-
     variable_catalog_df = pd.DataFrame(variable_catalog).drop_duplicates(subset=["label", "column"])
 
-    if variable_catalog_df.empty:
-        st.warning("Not enough variables were detected to create strategic segment charts.")
-    else:
-        lens_options = {
-            "School profile → current EdTech use": {
-                "segment_sections": ["Sample characteristics"],
-                "outcome_sections": ["Current EdTech use"],
-                "default_chart": "Mean / percentage bar"
-            },
-            "School profile → satisfaction and value": {
-                "segment_sections": ["Sample characteristics"],
-                "outcome_sections": ["Satisfaction and value"],
-                "default_chart": "Mean / percentage bar"
-            },
-            "School profile → adoption priorities and readiness": {
-                "segment_sections": ["Sample characteristics"],
-                "outcome_sections": ["Adoption priorities and readiness"],
-                "default_chart": "Heatmap"
-            },
-            "Current EdTech use → satisfaction and value": {
-                "segment_sections": ["Current EdTech use"],
-                "outcome_sections": ["Satisfaction and value"],
-                "default_chart": "Mean / percentage bar"
-            },
-            "Adoption readiness → current use or satisfaction": {
-                "segment_sections": ["Adoption priorities and readiness"],
-                "outcome_sections": ["Current EdTech use", "Satisfaction and value"],
-                "default_chart": "Heatmap"
-            }
-        }
+    lens_options = [
+        "EdTech category task-level usage",
+        "School profile → current EdTech use",
+        "School profile → satisfaction and value",
+        "School profile → adoption priorities and readiness",
+        "Current EdTech use → satisfaction and value",
+        "Adoption readiness → current use or satisfaction"
+    ]
 
-        selected_lens = st.selectbox(
-            "Strategic question",
-            list(lens_options.keys()),
-            key="strategic_lens"
+    selected_lens = st.selectbox(
+        "Strategic question",
+        lens_options,
+        key="strategic_lens"
+    )
+
+    if selected_lens == "EdTech category task-level usage":
+        st.caption(
+            "This view matches the reference chart logic. For each teaching task, it calculates the percentage of "
+            "stage respondents who selected each EdTech product category. The box plot or range chart then summarises "
+            "the spread of those task-level percentages. Dots represent tasks, not individual respondents."
         )
-        lens = lens_options[selected_lens]
 
-        segment_vars = variable_catalog_df[
-            (variable_catalog_df["type"] == "categorical")
-            & (variable_catalog_df["section"].isin(lens["segment_sections"]))
-        ].copy()
-        outcome_vars = variable_catalog_df[
-            (variable_catalog_df["role"].isin(["Outcome", "Both"]))
-            & (variable_catalog_df["section"].isin(lens["outcome_sections"]))
-        ].copy()
-
-        if segment_vars.empty or outcome_vars.empty:
-            st.warning("This strategic question does not have enough detected variables in the uploaded file.")
-        else:
-            controls_1, controls_2, controls_3 = st.columns([1, 1, 0.8])
-            with controls_1:
-                segment_label = st.selectbox(
-                    "Compare groups by",
-                    segment_vars["label"].tolist(),
-                    key="strategic_segment_by"
-                )
-            with controls_2:
-                outcome_label = st.selectbox(
-                    "Measure",
-                    outcome_vars["label"].tolist(),
-                    key="strategic_outcome"
-                )
-
-            segment_row = segment_vars[segment_vars["label"] == segment_label].iloc[0]
-            outcome_row = outcome_vars[outcome_vars["label"] == outcome_label].iloc[0]
-            segment_col = segment_row["column"]
-            outcome_col = outcome_row["column"]
-            outcome_type = outcome_row["type"]
-
-            if outcome_type == "numeric":
-                chart_options = ["Mean / percentage bar", "Distribution spread"]
-            else:
-                chart_options = ["Heatmap", "Grouped bar"]
-
-            with controls_3:
-                default_index = chart_options.index(lens["default_chart"]) if lens["default_chart"] in chart_options else 0
-                chart_choice = st.selectbox(
-                    "Chart type",
-                    chart_options,
-                    index=default_index,
-                    key="strategic_chart_type"
-                )
-
+        split_col_1, split_col_2, split_col_3, split_col_4 = st.columns([1, 1, 1, 0.8])
+        with split_col_1:
+            split_label = st.selectbox(
+                "Split chart by",
+                list(demographic_split_options.keys()),
+                index=0,
+                key="task_usage_split"
+            )
+        with split_col_2:
+            chart_view = st.selectbox(
+                "Chart view",
+                ["Box plot", "Range with median", "Range only"],
+                index=0,
+                key="task_usage_chart_view"
+            )
+        with split_col_3:
+            selected_tools = st.multiselect(
+                "EdTech product categories",
+                list(tool_specs.keys()),
+                default=list(tool_specs.keys()),
+                key="task_usage_tools"
+            )
+        with split_col_4:
             min_group_n = st.slider(
-                "Minimum responses per displayed group",
+                "Minimum group size",
                 min_value=1,
                 max_value=15,
                 value=3,
                 step=1,
-                help="Small groups are hidden to avoid unstable or misleading comparisons."
+                key="task_usage_min_group"
             )
 
-            if segment_col == outcome_col:
-                st.warning("Please choose different variables for the group comparison and the measure.")
+        split_col = demographic_split_options[split_label]
+        task_usage = make_task_level_tool_usage(segment_data, split_col=split_col, min_group_n=min_group_n)
+
+        if selected_tools:
+            task_usage = task_usage[task_usage["tool_type"].isin(selected_tools)].copy()
+
+        if task_usage.empty:
+            st.warning("No task-level usage data was available for the current selection.")
+        else:
+            if chart_view == "Range with median":
+                fig = plot_task_usage_range(task_usage, split_label, split_col=split_col, show_median=True)
+            elif chart_view == "Range only":
+                fig = plot_task_usage_range(task_usage, split_label, split_col=split_col, show_median=False)
             else:
-                plot_df = segment_data[[segment_col, outcome_col]].copy()
-                plot_df[segment_col] = plot_df[segment_col].fillna("Missing")
+                fig = plot_task_usage_boxplot(task_usage, split_label, split_col=split_col)
+            st.plotly_chart(fig, use_container_width=True)
 
-                group_sizes = plot_df.groupby(segment_col).size().reset_index(name="group_n")
-                valid_groups = group_sizes.loc[group_sizes["group_n"] >= min_group_n, segment_col].tolist()
-                plot_df = plot_df[plot_df[segment_col].isin(valid_groups)].copy()
+            st.caption(
+                "Reading guide: each dot represents one teaching task. The value is the percentage of stage respondents "
+                "who selected that product category for that task. The box/range summarises variation across tasks."
+            )
 
-                if plot_df.empty:
-                    st.warning("No groups met the minimum response threshold for this comparison.")
-                elif outcome_type == "numeric":
-                    plot_df[outcome_col] = pd.to_numeric(plot_df[outcome_col], errors="coerce")
-                    plot_df = plot_df.dropna(subset=[outcome_col])
+            if show_admin_details:
+                with st.expander("Admin: task-level usage data"):
+                    st.dataframe(task_usage, use_container_width=True)
 
-                    if plot_df.empty:
-                        st.warning("No valid numeric data was available for this selection.")
-                    elif chart_choice == "Distribution spread":
-                        fig = px.box(
-                            plot_df,
-                            x=segment_col,
-                            y=outcome_col,
-                            points="all",
-                            title=f"{outcome_label} by {segment_label}",
-                            labels={segment_col: segment_label, outcome_col: outcome_label}
-                        )
-                        fig.update_layout(
-                            template="plotly_white",
-                            height=650,
-                            xaxis_tickangle=-25,
-                            margin=dict(t=90, b=120, l=80, r=40)
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-                        st.caption(
-                            f"Reading guide: each point is one respondent. The box shows the spread of **{outcome_label}** within each **{segment_label}** group."
-                        )
-                    else:
-                        summary = plot_df.groupby(segment_col, as_index=False).agg(
-                            mean_value=(outcome_col, "mean"),
-                            median_value=(outcome_col, "median"),
-                            n=(outcome_col, "count")
-                        )
-                        summary = summary.sort_values("mean_value", ascending=False)
-                        summary["label"] = summary["mean_value"].round(1).astype(str)
+    else:
+        if variable_catalog_df.empty:
+            st.warning("Not enough variables were detected to create strategic segment charts.")
+        else:
+            lens_map = {
+                "School profile → current EdTech use": {
+                    "segment_sections": ["Sample characteristics"],
+                    "outcome_sections": ["Current EdTech use"],
+                    "default_chart": "Mean / percentage bar"
+                },
+                "School profile → satisfaction and value": {
+                    "segment_sections": ["Sample characteristics"],
+                    "outcome_sections": ["Satisfaction and value"],
+                    "default_chart": "Mean / percentage bar"
+                },
+                "School profile → adoption priorities and readiness": {
+                    "segment_sections": ["Sample characteristics"],
+                    "outcome_sections": ["Adoption priorities and readiness"],
+                    "default_chart": "Heatmap"
+                },
+                "Current EdTech use → satisfaction and value": {
+                    "segment_sections": ["Current EdTech use"],
+                    "outcome_sections": ["Satisfaction and value"],
+                    "default_chart": "Mean / percentage bar"
+                },
+                "Adoption readiness → current use or satisfaction": {
+                    "segment_sections": ["Adoption priorities and readiness"],
+                    "outcome_sections": ["Current EdTech use", "Satisfaction and value"],
+                    "default_chart": "Heatmap"
+                }
+            }
+            lens = lens_map[selected_lens]
 
-                        fig = px.bar(
-                            summary,
-                            x=segment_col,
-                            y="mean_value",
-                            title=f"{outcome_label} by {segment_label}",
-                            labels={segment_col: segment_label, "mean_value": f"Average {outcome_label}"},
-                            text="label",
-                            custom_data=["median_value", "n"]
-                        )
-                        fig.update_traces(
-                            textposition="outside",
-                            hovertemplate="<b>%{x}</b><br>Mean: %{y:.2f}<br>Median: %{customdata[0]:.2f}<br>Responses: %{customdata[1]}<extra></extra>"
-                        )
-                        fig.update_layout(
-                            template="plotly_white",
-                            height=650,
-                            xaxis_tickangle=-25,
-                            margin=dict(t=90, b=120, l=80, r=40)
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-                        st.caption(
-                            f"Reading guide: this chart shows the average **{outcome_label}** for each **{segment_label}** group. "
-                            "Hover over each bar to view the median and number of responses."
-                        )
+            segment_vars = variable_catalog_df[
+                (variable_catalog_df["type"] == "categorical")
+                & (variable_catalog_df["section"].isin(lens["segment_sections"]))
+            ].copy()
+            outcome_vars = variable_catalog_df[
+                (variable_catalog_df["role"].isin(["Outcome", "Both"]))
+                & (variable_catalog_df["section"].isin(lens["outcome_sections"]))
+            ].copy()
 
-                        if show_admin_details:
-                            with st.expander("Admin: summary table"):
-                                st.dataframe(summary, use_container_width=True)
-
-                else:
-                    plot_df[outcome_col] = plot_df[outcome_col].fillna("Missing")
-
-                    if chart_choice == "Grouped bar":
-                        ctab = pd.crosstab(plot_df[segment_col], plot_df[outcome_col], normalize="index") * 100
-                        count_tab = pd.crosstab(plot_df[segment_col], plot_df[outcome_col])
-                        long_df = ctab.reset_index().melt(id_vars=segment_col, var_name=outcome_label, value_name="percent")
-                        count_long = count_tab.reset_index().melt(id_vars=segment_col, var_name=outcome_label, value_name="count")
-                        long_df = long_df.merge(count_long, on=[segment_col, outcome_label], how="left")
-
-                        fig = px.bar(
-                            long_df,
-                            x=segment_col,
-                            y="percent",
-                            color=outcome_label,
-                            barmode="group",
-                            title=f"{outcome_label} by {segment_label}",
-                            labels={segment_col: segment_label, "percent": "% within group", outcome_label: outcome_label},
-                            custom_data=["count"]
-                        )
-                        fig.update_traces(
-                            hovertemplate="<b>%{x}</b><br>Category: %{fullData.name}<br>Percentage: %{y:.1f}%<br>Count: %{customdata[0]}<extra></extra>"
-                        )
-                        fig.update_layout(template="plotly_white", height=650, xaxis_tickangle=-25, margin=dict(t=90, b=120, l=80, r=40))
-                        st.plotly_chart(fig, use_container_width=True)
-                    else:
-                        fig = plot_crosstab_percent(
-                            plot_df,
-                            row_col=segment_col,
-                            col_col=outcome_col,
-                            row_label=segment_label,
-                            col_label=outcome_label,
-                            title=f"{outcome_label} by {segment_label}",
-                            chart_type="Heatmap"
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-
-                    st.caption(
-                        f"Reading guide: percentages are calculated within each **{segment_label}** group, so each group sums to 100%. "
-                        f"This helps show whether **{outcome_label}** differs across strategic segments."
+            if segment_vars.empty or outcome_vars.empty:
+                st.warning("This strategic question does not have enough detected variables in the uploaded file.")
+            else:
+                controls_1, controls_2, controls_3 = st.columns([1, 1, 0.8])
+                with controls_1:
+                    segment_label = st.selectbox(
+                        "Compare groups by",
+                        segment_vars["label"].tolist(),
+                        key="strategic_segment_by"
+                    )
+                with controls_2:
+                    outcome_label = st.selectbox(
+                        "Measure",
+                        outcome_vars["label"].tolist(),
+                        key="strategic_outcome"
                     )
 
-                    if show_admin_details:
-                        with st.expander("Admin: cross-tabulation"):
-                            st.dataframe(pd.crosstab(plot_df[segment_col], plot_df[outcome_col]), use_container_width=True)
+                segment_row = segment_vars[segment_vars["label"] == segment_label].iloc[0]
+                outcome_row = outcome_vars[outcome_vars["label"] == outcome_label].iloc[0]
+                segment_col = segment_row["column"]
+                outcome_col = outcome_row["column"]
+                outcome_type = outcome_row["type"]
 
-        if show_admin_details:
-            with st.expander("Admin: variables available in Strategic Segments"):
-                st.dataframe(variable_catalog_df, use_container_width=True)
+                if outcome_type == "numeric":
+                    chart_options = ["Mean / percentage bar", "Distribution spread"]
+                else:
+                    chart_options = ["Heatmap", "Grouped bar"]
+
+                with controls_3:
+                    default_index = chart_options.index(lens["default_chart"]) if lens["default_chart"] in chart_options else 0
+                    chart_choice = st.selectbox(
+                        "Chart type",
+                        chart_options,
+                        index=default_index,
+                        key="strategic_chart_type"
+                    )
+
+                min_group_n = st.slider(
+                    "Minimum responses per displayed group",
+                    min_value=1,
+                    max_value=15,
+                    value=3,
+                    step=1,
+                    help="Small groups are hidden to avoid unstable or misleading comparisons.",
+                    key="strategic_general_min_group"
+                )
+
+                if segment_col == outcome_col:
+                    st.warning("Please choose different variables for the group comparison and the measure.")
+                else:
+                    plot_df = segment_data[[segment_col, outcome_col]].copy()
+                    plot_df[segment_col] = plot_df[segment_col].fillna("Missing")
+
+                    group_sizes = plot_df.groupby(segment_col).size().reset_index(name="group_n")
+                    valid_groups = group_sizes.loc[group_sizes["group_n"] >= min_group_n, segment_col].tolist()
+                    plot_df = plot_df[plot_df[segment_col].isin(valid_groups)].copy()
+
+                    if plot_df.empty:
+                        st.warning("No groups met the minimum response threshold for this comparison.")
+                    elif outcome_type == "numeric":
+                        plot_df[outcome_col] = pd.to_numeric(plot_df[outcome_col], errors="coerce")
+                        plot_df = plot_df.dropna(subset=[outcome_col])
+
+                        if plot_df.empty:
+                            st.warning("No valid numeric data was available for this selection.")
+                        elif chart_choice == "Distribution spread":
+                            fig = px.box(
+                                plot_df,
+                                x=segment_col,
+                                y=outcome_col,
+                                points="all",
+                                title=f"{outcome_label} by {segment_label}",
+                                labels={segment_col: segment_label, outcome_col: outcome_label}
+                            )
+                            fig.update_layout(template="plotly_white", height=650, xaxis_tickangle=-25, margin=dict(t=90, b=120, l=80, r=40))
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            summary = plot_df.groupby(segment_col, as_index=False).agg(
+                                mean_value=(outcome_col, "mean"),
+                                median_value=(outcome_col, "median"),
+                                n=(outcome_col, "count")
+                            )
+                            summary = summary.sort_values("mean_value", ascending=False)
+                            summary["label"] = summary["mean_value"].round(1).astype(str)
+                            fig = px.bar(
+                                summary,
+                                x=segment_col,
+                                y="mean_value",
+                                title=f"{outcome_label} by {segment_label}",
+                                labels={segment_col: segment_label, "mean_value": f"Average {outcome_label}"},
+                                text="label",
+                                custom_data=["median_value", "n"]
+                            )
+                            fig.update_traces(
+                                textposition="outside",
+                                hovertemplate="<b>%{x}</b><br>Mean: %{y:.2f}<br>Median: %{customdata[0]:.2f}<br>Responses: %{customdata[1]}<extra></extra>"
+                            )
+                            fig.update_layout(template="plotly_white", height=650, xaxis_tickangle=-25, margin=dict(t=90, b=120, l=80, r=40))
+                            st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        plot_df[outcome_col] = plot_df[outcome_col].fillna("Missing")
+
+                        if chart_choice == "Grouped bar":
+                            ctab = pd.crosstab(plot_df[segment_col], plot_df[outcome_col], normalize="index") * 100
+                            count_tab = pd.crosstab(plot_df[segment_col], plot_df[outcome_col])
+                            long_df = ctab.reset_index().melt(id_vars=segment_col, var_name=outcome_label, value_name="percent")
+                            count_long = count_tab.reset_index().melt(id_vars=segment_col, var_name=outcome_label, value_name="count")
+                            long_df = long_df.merge(count_long, on=[segment_col, outcome_label], how="left")
+
+                            fig = px.bar(
+                                long_df,
+                                x=segment_col,
+                                y="percent",
+                                color=outcome_label,
+                                barmode="group",
+                                title=f"{outcome_label} by {segment_label}",
+                                labels={segment_col: segment_label, "percent": "% within group", outcome_label: outcome_label},
+                                custom_data=["count"]
+                            )
+                            fig.update_traces(
+                                hovertemplate="<b>%{x}</b><br>Category: %{fullData.name}<br>Percentage: %{y:.1f}%<br>Count: %{customdata[0]}<extra></extra>"
+                            )
+                            fig.update_layout(template="plotly_white", height=650, xaxis_tickangle=-25, margin=dict(t=90, b=120, l=80, r=40))
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            fig = plot_crosstab_percent(
+                                plot_df,
+                                row_col=segment_col,
+                                col_col=outcome_col,
+                                row_label=segment_label,
+                                col_label=outcome_label,
+                                title=f"{outcome_label} by {segment_label}",
+                                chart_type="Heatmap"
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+
+                    if show_admin_details:
+                        with st.expander("Admin: strategic segment source data"):
+                            st.dataframe(plot_df, use_container_width=True)
+
+    if show_admin_details:
+        with st.expander("Admin: variables available in Strategic Segments"):
+            st.dataframe(variable_catalog_df, use_container_width=True)
 
 
 # ============================================================
