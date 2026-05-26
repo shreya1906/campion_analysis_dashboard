@@ -3,6 +3,7 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+import numpy as np
 
 # ============================================================
 # Streamlit page setup and client-facing styling
@@ -1633,6 +1634,17 @@ with tab_interactions:
         "school and respondent segments. The options are intentionally focused so the comparisons remain interpretable."
     )
 
+    strategic_view = st.radio(
+        "Choose strategic comparison",
+        [
+            "Adoption and readiness by demographic",
+            "Current EdTech use by demographic",
+            "Satisfaction by demographic"
+        ],
+        horizontal=True,
+        key="strategic_view_selector"
+    )
+
     segment_data = data_for_interactions.copy()
 
     # ------------------------------------------------------------
@@ -1889,22 +1901,356 @@ with tab_interactions:
 
     variable_catalog_df = pd.DataFrame(variable_catalog).drop_duplicates(subset=["label", "column"])
 
-    lens_options = [
-        "EdTech category task-level usage",
-        "School profile → current EdTech use",
-        "School profile → satisfaction and value",
-        "School profile → adoption priorities and readiness",
-        "Current EdTech use → satisfaction and value",
-        "Adoption readiness → current use or satisfaction"
-    ]
+    # ------------------------------------------------------------
+    # Adoption × demographics explorer
+    # ------------------------------------------------------------
+    if strategic_view == "Adoption and readiness by demographic":
+        st.subheader("Adoption and readiness by demographic")
+        st.write(
+            "Select one demographic split and one adoption or readiness metric. The chart shows how responses "
+            "to the adoption metric are distributed within each demographic group."
+        )
 
-    selected_lens = st.selectbox(
-        "Strategic question",
-        lens_options,
-        key="strategic_lens"
-    )
+        adoption_metric_options = {}
+        for label, col in available_adoption_vars.items():
+            if col is not None and col in segment_data.columns:
+                adoption_metric_options[label] = col
 
-    if selected_lens == "EdTech category task-level usage":
+        def group_adoption_metric_options(metric_options):
+            """
+            Combines related adoption/readiness fields into client-facing groups.
+            For example:
+              Journey expansion interest: Planning and curriculum
+              Journey expansion interest: Lesson preparation
+            becomes:
+              Adoption/readiness category = Journey expansion interest
+              Specific metric = Planning and curriculum / Lesson preparation
+            """
+            grouped = {}
+            for metric_label, metric_col in metric_options.items():
+                if ":" in metric_label:
+                    group_label, item_label = metric_label.split(":", 1)
+                    group_label = group_label.strip()
+                    item_label = item_label.strip()
+                else:
+                    group_label = metric_label.strip()
+                    item_label = "Overall"
+
+                if group_label not in grouped:
+                    grouped[group_label] = {}
+                grouped[group_label][item_label] = metric_col
+            return grouped
+
+        def simplify_adoption_response(value):
+            """Combine near-equivalent response categories to reduce visual clutter."""
+            if pd.isna(value):
+                return "Missing"
+
+            text = str(value).strip()
+            text_lower = text.lower()
+
+            # Important: check negative forms before checking positive interest terms.
+            if text_lower in ["not interested", "not at all interested"]:
+                return "Not interested"
+            if text_lower in ["extremely interested", "interested", "very interested"]:
+                return "Interested / extremely interested"
+            if text_lower in ["somewhat interested", "slightly interested"]:
+                return "Somewhat interested"
+
+            return text
+
+        def is_positive_adoption_response(value):
+            """
+            Used for the compact combined heatmap. It highlights affirmative / high-interest responses.
+            """
+            text = simplify_adoption_response(value).lower()
+            positive_values = {
+                "interested / extremely interested",
+                "yes",
+                "very likely",
+                "likely",
+                "agree",
+                "strongly agree",
+                "high priority",
+                "very high priority"
+            }
+            return text in positive_values
+
+        adoption_metric_groups = group_adoption_metric_options(adoption_metric_options)
+
+        demographic_options = {}
+        for label, col in available_profile_vars.items():
+            if col is not None and col in segment_data.columns:
+                demographic_options[label] = col
+
+        if not adoption_metric_groups or not demographic_options:
+            st.warning("Could not detect enough adoption/readiness and demographic variables for this comparison.")
+        else:
+            demo_col_1, demo_col_2, demo_col_3, demo_col_4 = st.columns([1, 1, 1, 0.8])
+            with demo_col_1:
+                demographic_label = st.selectbox(
+                    "Demographic split",
+                    list(demographic_options.keys()),
+                    key="strategic_adoption_demo_split_top"
+                )
+            with demo_col_2:
+                adoption_group_label = st.selectbox(
+                    "Adoption/readiness category",
+                    list(adoption_metric_groups.keys()),
+                    key="strategic_adoption_group_top"
+                )
+            with demo_col_3:
+                metric_items = list(adoption_metric_groups[adoption_group_label].keys())
+                combined_option = "All metrics in this category"
+                metric_select_options = [combined_option] + metric_items if len(metric_items) > 1 else metric_items
+                adoption_item_label = st.selectbox(
+                    "Specific metric",
+                    metric_select_options,
+                    key="strategic_adoption_metric_top"
+                )
+            with demo_col_4:
+                adoption_chart_view = st.selectbox(
+                    "Chart view",
+                    ["Compact positive heatmap", "Heatmap", "Grouped bar", "100% stacked bar"],
+                    key="strategic_adoption_demo_chart_view_top"
+                )
+
+            min_demo_group_n = st.slider(
+                "Minimum responses per demographic group",
+                min_value=1,
+                max_value=15,
+                value=3,
+                step=1,
+                key="strategic_adoption_demo_min_group_top"
+            )
+
+            demographic_col = demographic_options[demographic_label]
+
+            if adoption_item_label == "All metrics in this category":
+                selected_metric_map = adoption_metric_groups[adoption_group_label]
+                combined_frames = []
+
+                for metric_label, metric_col in selected_metric_map.items():
+                    temp = segment_data[[demographic_col, metric_col]].copy()
+                    temp[demographic_col] = temp[demographic_col].fillna("Missing").astype(str)
+                    temp["metric"] = metric_label
+                    temp["response"] = temp[metric_col].apply(simplify_adoption_response)
+                    combined_frames.append(temp[[demographic_col, "metric", "response"]])
+
+                adoption_demo_df = pd.concat(combined_frames, ignore_index=True)
+
+                group_sizes = segment_data.groupby(demographic_col).size().reset_index(name="group_n")
+                group_sizes[demographic_col] = group_sizes[demographic_col].fillna("Missing").astype(str)
+                valid_groups = group_sizes.loc[group_sizes["group_n"] >= min_demo_group_n, demographic_col].tolist()
+                adoption_demo_df = adoption_demo_df[adoption_demo_df[demographic_col].isin(valid_groups)].copy()
+
+                if adoption_demo_df.empty:
+                    st.warning("No demographic groups met the minimum response threshold.")
+                else:
+                    count_tab = adoption_demo_df.groupby([demographic_col, "metric", "response"]).size().reset_index(name="count")
+                    denominator = adoption_demo_df.groupby([demographic_col, "metric"]).size().reset_index(name="denominator")
+                    long_df = count_tab.merge(denominator, on=[demographic_col, "metric"], how="left")
+                    long_df["percent"] = long_df["count"] / long_df["denominator"] * 100
+
+                    if adoption_chart_view == "Compact positive heatmap":
+                        positive_df = adoption_demo_df.copy()
+                        positive_df["positive_response"] = positive_df["response"].apply(is_positive_adoption_response)
+
+                        positive_summary = positive_df.groupby([demographic_col, "metric"], as_index=False).agg(
+                            positive_percent=("positive_response", lambda x: x.mean() * 100),
+                            n=("positive_response", "count")
+                        )
+
+                        heatmap_matrix = positive_summary.pivot_table(
+                            index="metric",
+                            columns=demographic_col,
+                            values="positive_percent",
+                            aggfunc="mean",
+                            fill_value=0
+                        )
+
+                        fig = px.imshow(
+                            heatmap_matrix,
+                            aspect="auto",
+                            text_auto=".1f",
+                            color_continuous_scale="Blues",
+                            title=f"Positive Adoption/Readiness Response: {adoption_group_label} by {demographic_label}",
+                            labels=dict(
+                                x=demographic_label,
+                                y=adoption_group_label,
+                                color="Positive response (%)"
+                            )
+                        )
+                        fig.update_layout(
+                            template="plotly_white",
+                            height=max(550, 42 * heatmap_matrix.shape[0]),
+                            margin=dict(t=90, b=120, l=260, r=40)
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                        st.caption(
+                            "Compact view: cells show the percentage of respondents in each demographic group who gave an affirmative/high-interest response. "
+                            "For interest questions, ‘Interested’ and ‘Extremely interested’ are combined."
+                        )
+                    elif adoption_chart_view == "Heatmap":
+                        heatmap_df = long_df.copy()
+                        heatmap_df["metric_response"] = heatmap_df["metric"] + " — " + heatmap_df["response"]
+                        fig = px.imshow(
+                            heatmap_df.pivot_table(
+                                index="metric_response",
+                                columns=demographic_col,
+                                values="percent",
+                                aggfunc="sum",
+                                fill_value=0
+                            ),
+                            aspect="auto",
+                            text_auto=".1f",
+                            color_continuous_scale="Blues",
+                            title=f"{adoption_group_label} by {demographic_label}",
+                            labels=dict(x=demographic_label, y="Metric and response", color="% within group")
+                        )
+                        fig.update_layout(
+                            template="plotly_white",
+                            height=max(650, 35 * heatmap_df["metric_response"].nunique()),
+                            margin=dict(t=90, b=120, l=280, r=40)
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        fig = px.bar(
+                            long_df,
+                            x="percent",
+                            y="metric",
+                            color="response",
+                            facet_col=demographic_col,
+                            facet_col_wrap=2,
+                            orientation="h",
+                            barmode="stack" if adoption_chart_view == "100% stacked bar" else "group",
+                            title=f"{adoption_group_label} by {demographic_label}",
+                            labels={
+                                "metric": adoption_group_label,
+                                "percent": "% within demographic group",
+                                "response": "Response"
+                            },
+                            custom_data=["count", "denominator"]
+                        )
+                        fig.update_traces(
+                            hovertemplate=(
+                                "<b>%{y}</b><br>"
+                                "Response: %{fullData.name}<br>"
+                                "Percentage: %{x:.1f}%<br>"
+                                "Count: %{customdata[0]} / %{customdata[1]}"
+                                "<extra></extra>"
+                            )
+                        )
+
+                        # Clean facet titles: Plotly defaults to very long labels like
+                        # "column_name=value", which creates clutter across the top.
+                        fig.for_each_annotation(
+                            lambda annotation: annotation.update(
+                                text=str(annotation.text).split("=")[-1][:42] + ("…" if len(str(annotation.text).split("=")[-1]) > 42 else ""),
+                                font=dict(size=13)
+                            )
+                        )
+
+                        fig.update_xaxes(range=[0, 100], ticksuffix="%")
+                        fig.update_yaxes(automargin=True)
+                        fig.update_layout(
+                            template="plotly_white",
+                            height=max(750, 360 * max(1, int(np.ceil(adoption_demo_df[demographic_col].nunique() / 2)))),
+                            margin=dict(t=100, b=80, l=260, r=40),
+                            legend_title="Response"
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+
+                st.caption(
+                    f"Reading guide: this combined view shows every metric inside **{adoption_group_label}**. "
+                    f"Percentages are calculated within each **{demographic_label}** group and within each metric."
+                )
+
+                if show_admin_details:
+                    with st.expander("Admin: combined adoption-by-demographic data"):
+                        st.dataframe(adoption_demo_df, use_container_width=True)
+
+            else:
+                adoption_col = adoption_metric_groups[adoption_group_label][adoption_item_label]
+                adoption_label = adoption_group_label if adoption_item_label == "Overall" else f"{adoption_group_label}: {adoption_item_label}"
+
+                adoption_demo_df = segment_data[[demographic_col, adoption_col]].copy()
+                adoption_demo_df[demographic_col] = adoption_demo_df[demographic_col].fillna("Missing").astype(str)
+                adoption_demo_df[adoption_col] = adoption_demo_df[adoption_col].apply(simplify_adoption_response)
+
+                group_sizes = adoption_demo_df.groupby(demographic_col).size().reset_index(name="group_n")
+                valid_groups = group_sizes.loc[group_sizes["group_n"] >= min_demo_group_n, demographic_col].tolist()
+                adoption_demo_df = adoption_demo_df[adoption_demo_df[demographic_col].isin(valid_groups)].copy()
+
+                if adoption_demo_df.empty:
+                    st.warning("No demographic groups met the minimum response threshold.")
+                elif adoption_chart_view == "Heatmap":
+                    fig = plot_crosstab_percent(
+                        adoption_demo_df,
+                        row_col=demographic_col,
+                        col_col=adoption_col,
+                        row_label=demographic_label,
+                        col_label=adoption_label,
+                        title=f"{adoption_label} by {demographic_label}",
+                        chart_type="Heatmap"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    count_tab = pd.crosstab(adoption_demo_df[demographic_col], adoption_demo_df[adoption_col])
+                    percent_tab = pd.crosstab(adoption_demo_df[demographic_col], adoption_demo_df[adoption_col], normalize="index") * 100
+                    long_df = percent_tab.reset_index().melt(
+                        id_vars=demographic_col,
+                        var_name=adoption_label,
+                        value_name="percent"
+                    )
+                    count_long = count_tab.reset_index().melt(
+                        id_vars=demographic_col,
+                        var_name=adoption_label,
+                        value_name="count"
+                    )
+                    long_df = long_df.merge(count_long, on=[demographic_col, adoption_label], how="left")
+
+                    fig = px.bar(
+                        long_df,
+                        x=demographic_col,
+                        y="percent",
+                        color=adoption_label,
+                        barmode="stack" if adoption_chart_view == "100% stacked bar" else "group",
+                        title=f"{adoption_label} by {demographic_label}",
+                        labels={
+                            demographic_col: demographic_label,
+                            "percent": "% within demographic group",
+                            adoption_label: adoption_label
+                        },
+                        custom_data=["count"]
+                    )
+                    fig.update_traces(
+                        hovertemplate="<b>%{x}</b><br>Response: %{fullData.name}<br>Percentage: %{y:.1f}%<br>Count: %{customdata[0]}<extra></extra>"
+                    )
+                    fig.update_layout(
+                        template="plotly_white",
+                        height=650,
+                        xaxis_tickangle=-25,
+                        yaxis=dict(range=[0, 100], ticksuffix="%"),
+                        margin=dict(t=90, b=140, l=80, r=40),
+                        legend_title=adoption_label
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                st.caption(
+                    f"Reading guide: percentages are calculated within each **{demographic_label}** group. "
+                    f"This lets you see whether adoption/readiness patterns differ by school or respondent segment."
+                )
+
+                if show_admin_details:
+                    with st.expander("Admin: adoption-by-demographic cross-tab"):
+                        st.dataframe(pd.crosstab(adoption_demo_df[demographic_col], adoption_demo_df[adoption_col]), use_container_width=True)
+
+    # ------------------------------------------------------------
+    # Section 1: Task-level usage by product category
+    # ------------------------------------------------------------
+    if strategic_view == "Current EdTech use by demographic":
+        st.subheader("EdTech category task-level usage")
         st.caption(
             "This view matches the reference chart logic. For each teaching task, it calculates the percentage of "
             "stage respondents who selected each EdTech product category. The box plot or range chart then summarises "
@@ -1969,187 +2315,89 @@ with tab_interactions:
                 with st.expander("Admin: task-level usage data"):
                     st.dataframe(task_usage, use_container_width=True)
 
-    else:
-        if variable_catalog_df.empty:
-            st.warning("Not enough variables were detected to create strategic segment charts.")
+
+
+    if strategic_view == "Satisfaction by demographic":
+        st.subheader("Satisfaction by demographic")
+        st.write(
+            "Compare satisfaction with each EdTech product category across respondent and school profile groups."
+        )
+
+        q15_cols_segments = find_q15_columns(segment_data)
+        demographic_options = {
+            label: col for label, col in available_profile_vars.items()
+            if col is not None and col in segment_data.columns
+        }
+
+        if not q15_cols_segments or not demographic_options:
+            st.warning("Could not detect enough satisfaction and demographic variables for this comparison.")
         else:
-            lens_map = {
-                "School profile → current EdTech use": {
-                    "segment_sections": ["Sample characteristics"],
-                    "outcome_sections": ["Current EdTech use"],
-                    "default_chart": "Mean / percentage bar"
-                },
-                "School profile → satisfaction and value": {
-                    "segment_sections": ["Sample characteristics"],
-                    "outcome_sections": ["Satisfaction and value"],
-                    "default_chart": "Mean / percentage bar"
-                },
-                "School profile → adoption priorities and readiness": {
-                    "segment_sections": ["Sample characteristics"],
-                    "outcome_sections": ["Adoption priorities and readiness"],
-                    "default_chart": "Heatmap"
-                },
-                "Current EdTech use → satisfaction and value": {
-                    "segment_sections": ["Current EdTech use"],
-                    "outcome_sections": ["Satisfaction and value"],
-                    "default_chart": "Mean / percentage bar"
-                },
-                "Adoption readiness → current use or satisfaction": {
-                    "segment_sections": ["Adoption priorities and readiness"],
-                    "outcome_sections": ["Current EdTech use", "Satisfaction and value"],
-                    "default_chart": "Heatmap"
-                }
-            }
-            lens = lens_map[selected_lens]
-
-            segment_vars = variable_catalog_df[
-                (variable_catalog_df["type"] == "categorical")
-                & (variable_catalog_df["section"].isin(lens["segment_sections"]))
-            ].copy()
-            outcome_vars = variable_catalog_df[
-                (variable_catalog_df["role"].isin(["Outcome", "Both"]))
-                & (variable_catalog_df["section"].isin(lens["outcome_sections"]))
-            ].copy()
-
-            if segment_vars.empty or outcome_vars.empty:
-                st.warning("This strategic question does not have enough detected variables in the uploaded file.")
-            else:
-                controls_1, controls_2, controls_3 = st.columns([1, 1, 0.8])
-                with controls_1:
-                    segment_label = st.selectbox(
-                        "Compare groups by",
-                        segment_vars["label"].tolist(),
-                        key="strategic_segment_by"
-                    )
-                with controls_2:
-                    outcome_label = st.selectbox(
-                        "Measure",
-                        outcome_vars["label"].tolist(),
-                        key="strategic_outcome"
-                    )
-
-                segment_row = segment_vars[segment_vars["label"] == segment_label].iloc[0]
-                outcome_row = outcome_vars[outcome_vars["label"] == outcome_label].iloc[0]
-                segment_col = segment_row["column"]
-                outcome_col = outcome_row["column"]
-                outcome_type = outcome_row["type"]
-
-                if outcome_type == "numeric":
-                    chart_options = ["Mean / percentage bar", "Distribution spread"]
-                else:
-                    chart_options = ["Heatmap", "Grouped bar"]
-
-                with controls_3:
-                    default_index = chart_options.index(lens["default_chart"]) if lens["default_chart"] in chart_options else 0
-                    chart_choice = st.selectbox(
-                        "Chart type",
-                        chart_options,
-                        index=default_index,
-                        key="strategic_chart_type"
-                    )
-
-                min_group_n = st.slider(
-                    "Minimum responses per displayed group",
+            sat_col_1, sat_col_2 = st.columns([1, 0.8])
+            with sat_col_1:
+                satisfaction_demo_label = st.selectbox(
+                    "Demographic split",
+                    list(demographic_options.keys()),
+                    key="strategic_satisfaction_demo_split"
+                )
+            with sat_col_2:
+                satisfaction_min_n = st.slider(
+                    "Minimum responses per group",
                     min_value=1,
                     max_value=15,
                     value=3,
                     step=1,
-                    help="Small groups are hidden to avoid unstable or misleading comparisons.",
-                    key="strategic_general_min_group"
+                    key="strategic_satisfaction_min_group"
                 )
 
-                if segment_col == outcome_col:
-                    st.warning("Please choose different variables for the group comparison and the measure.")
+            satisfaction_demo_col = demographic_options[satisfaction_demo_label]
+            sat_fig, sat_summary = plot_satisfaction_by_group(
+                segment_data,
+                group_col=satisfaction_demo_col,
+                group_label=satisfaction_demo_label,
+                q15_cols=q15_cols_segments
+            )
+
+            if sat_fig is None or sat_summary.empty:
+                st.warning("No satisfaction data was available for this comparison.")
+            else:
+                valid_groups = sat_summary.groupby(satisfaction_demo_col)["n"].sum()
+                valid_groups = valid_groups[valid_groups >= satisfaction_min_n].index.tolist()
+                sat_summary = sat_summary[sat_summary[satisfaction_demo_col].isin(valid_groups)].copy()
+
+                if sat_summary.empty:
+                    st.warning("No demographic groups met the minimum response threshold.")
                 else:
-                    plot_df = segment_data[[segment_col, outcome_col]].copy()
-                    plot_df[segment_col] = plot_df[segment_col].fillna("Missing")
+                    fig = px.bar(
+                        sat_summary,
+                        x=satisfaction_demo_col,
+                        y="mean_satisfaction",
+                        color="tool_type",
+                        barmode="group",
+                        title=f"Mean Satisfaction by {satisfaction_demo_label}",
+                        labels={
+                            satisfaction_demo_col: satisfaction_demo_label,
+                            "mean_satisfaction": "Mean Satisfaction Score",
+                            "tool_type": "Tool Type"
+                        },
+                        custom_data=["n"],
+                        color_discrete_map=color_map
+                    )
+                    fig.update_traces(
+                        hovertemplate="<b>%{x}</b><br>Tool type: %{fullData.name}<br>Mean satisfaction: %{y:.2f}<br>Responses: %{customdata[0]}<extra></extra>"
+                    )
+                    fig.update_layout(
+                        template="plotly_white",
+                        height=650,
+                        yaxis=dict(range=[0, 10], dtick=1),
+                        xaxis_tickangle=-25,
+                        margin=dict(t=90, b=140, l=80, r=40),
+                        legend_title="EdTech Product Category"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
 
-                    group_sizes = plot_df.groupby(segment_col).size().reset_index(name="group_n")
-                    valid_groups = group_sizes.loc[group_sizes["group_n"] >= min_group_n, segment_col].tolist()
-                    plot_df = plot_df[plot_df[segment_col].isin(valid_groups)].copy()
-
-                    if plot_df.empty:
-                        st.warning("No groups met the minimum response threshold for this comparison.")
-                    elif outcome_type == "numeric":
-                        plot_df[outcome_col] = pd.to_numeric(plot_df[outcome_col], errors="coerce")
-                        plot_df = plot_df.dropna(subset=[outcome_col])
-
-                        if plot_df.empty:
-                            st.warning("No valid numeric data was available for this selection.")
-                        elif chart_choice == "Distribution spread":
-                            fig = px.box(
-                                plot_df,
-                                x=segment_col,
-                                y=outcome_col,
-                                points="all",
-                                title=f"{outcome_label} by {segment_label}",
-                                labels={segment_col: segment_label, outcome_col: outcome_label}
-                            )
-                            fig.update_layout(template="plotly_white", height=650, xaxis_tickangle=-25, margin=dict(t=90, b=120, l=80, r=40))
-                            st.plotly_chart(fig, use_container_width=True)
-                        else:
-                            summary = plot_df.groupby(segment_col, as_index=False).agg(
-                                mean_value=(outcome_col, "mean"),
-                                median_value=(outcome_col, "median"),
-                                n=(outcome_col, "count")
-                            )
-                            summary = summary.sort_values("mean_value", ascending=False)
-                            summary["label"] = summary["mean_value"].round(1).astype(str)
-                            fig = px.bar(
-                                summary,
-                                x=segment_col,
-                                y="mean_value",
-                                title=f"{outcome_label} by {segment_label}",
-                                labels={segment_col: segment_label, "mean_value": f"Average {outcome_label}"},
-                                text="label",
-                                custom_data=["median_value", "n"]
-                            )
-                            fig.update_traces(
-                                textposition="outside",
-                                hovertemplate="<b>%{x}</b><br>Mean: %{y:.2f}<br>Median: %{customdata[0]:.2f}<br>Responses: %{customdata[1]}<extra></extra>"
-                            )
-                            fig.update_layout(template="plotly_white", height=650, xaxis_tickangle=-25, margin=dict(t=90, b=120, l=80, r=40))
-                            st.plotly_chart(fig, use_container_width=True)
-                    else:
-                        plot_df[outcome_col] = plot_df[outcome_col].fillna("Missing")
-
-                        if chart_choice == "Grouped bar":
-                            ctab = pd.crosstab(plot_df[segment_col], plot_df[outcome_col], normalize="index") * 100
-                            count_tab = pd.crosstab(plot_df[segment_col], plot_df[outcome_col])
-                            long_df = ctab.reset_index().melt(id_vars=segment_col, var_name=outcome_label, value_name="percent")
-                            count_long = count_tab.reset_index().melt(id_vars=segment_col, var_name=outcome_label, value_name="count")
-                            long_df = long_df.merge(count_long, on=[segment_col, outcome_label], how="left")
-
-                            fig = px.bar(
-                                long_df,
-                                x=segment_col,
-                                y="percent",
-                                color=outcome_label,
-                                barmode="group",
-                                title=f"{outcome_label} by {segment_label}",
-                                labels={segment_col: segment_label, "percent": "% within group", outcome_label: outcome_label},
-                                custom_data=["count"]
-                            )
-                            fig.update_traces(
-                                hovertemplate="<b>%{x}</b><br>Category: %{fullData.name}<br>Percentage: %{y:.1f}%<br>Count: %{customdata[0]}<extra></extra>"
-                            )
-                            fig.update_layout(template="plotly_white", height=650, xaxis_tickangle=-25, margin=dict(t=90, b=120, l=80, r=40))
-                            st.plotly_chart(fig, use_container_width=True)
-                        else:
-                            fig = plot_crosstab_percent(
-                                plot_df,
-                                row_col=segment_col,
-                                col_col=outcome_col,
-                                row_label=segment_label,
-                                col_label=outcome_label,
-                                title=f"{outcome_label} by {segment_label}",
-                                chart_type="Heatmap"
-                            )
-                            st.plotly_chart(fig, use_container_width=True)
-
-                    if show_admin_details:
-                        with st.expander("Admin: strategic segment source data"):
-                            st.dataframe(plot_df, use_container_width=True)
+                if show_admin_details:
+                    with st.expander("Admin: satisfaction-by-demographic summary"):
+                        st.dataframe(sat_summary, use_container_width=True)
 
     if show_admin_details:
         with st.expander("Admin: variables available in Strategic Segments"):
