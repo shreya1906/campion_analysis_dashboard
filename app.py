@@ -1941,8 +1941,8 @@ with tab_interactions:
                 grouped[group_label][item_label] = metric_col
             return grouped
 
-        def simplify_adoption_response(value):
-            """Combine near-equivalent response categories to reduce visual clutter."""
+        def simplify_adoption_response(value, combine_interest=False):
+            """Clean response labels, with optional combination of high-interest categories."""
             if pd.isna(value):
                 return "Missing"
 
@@ -1952,10 +1952,22 @@ with tab_interactions:
             # Important: check negative forms before checking positive interest terms.
             if text_lower in ["not interested", "not at all interested"]:
                 return "Not interested"
-            if text_lower in ["extremely interested", "interested", "very interested"]:
-                return "Interested / extremely interested"
+
+            if combine_interest:
+                if text_lower in ["extremely interested", "very interested", "interested"]:
+                    return "Interested / very / extremely interested"
+            else:
+                if text_lower == "extremely interested":
+                    return "Extremely interested"
+                if text_lower == "very interested":
+                    return "Very interested"
+                if text_lower == "interested":
+                    return "Interested"
+
             if text_lower in ["somewhat interested", "slightly interested"]:
                 return "Somewhat interested"
+            if text_lower == "moderately interested":
+                return "Moderately interested"
 
             return text
 
@@ -1966,6 +1978,10 @@ with tab_interactions:
             text = simplify_adoption_response(value).lower()
             positive_values = {
                 "interested / extremely interested",
+                "interested / very / extremely interested",
+                "interested",
+                "very interested",
+                "extremely interested",
                 "yes",
                 "very likely",
                 "likely",
@@ -2015,6 +2031,21 @@ with tab_interactions:
                     key="strategic_adoption_demo_chart_view_top"
                 )
 
+            response_control_1, response_control_2 = st.columns([1, 1])
+            with response_control_1:
+                include_missing_responses = st.toggle(
+                    "Include missing responses",
+                    value=False,
+                    key="strategic_include_missing_responses"
+                )
+            with response_control_2:
+                combine_interest_responses = st.toggle(
+                    "Combine interest categories",
+                    value=False,
+                    help="When switched on, Interested, Very interested, and Extremely interested are combined into one category.",
+                    key="strategic_combine_interest_responses"
+                )
+
             min_demo_group_n = st.slider(
                 "Minimum responses per demographic group",
                 min_value=1,
@@ -2034,7 +2065,7 @@ with tab_interactions:
                     temp = segment_data[[demographic_col, metric_col]].copy()
                     temp[demographic_col] = temp[demographic_col].fillna("Missing").astype(str)
                     temp["metric"] = metric_label
-                    temp["response"] = temp[metric_col].apply(simplify_adoption_response)
+                    temp["response"] = temp[metric_col].apply(lambda x: simplify_adoption_response(x, combine_interest=combine_interest_responses))
                     combined_frames.append(temp[[demographic_col, "metric", "response"]])
 
                 adoption_demo_df = pd.concat(combined_frames, ignore_index=True)
@@ -2043,6 +2074,35 @@ with tab_interactions:
                 group_sizes[demographic_col] = group_sizes[demographic_col].fillna("Missing").astype(str)
                 valid_groups = group_sizes.loc[group_sizes["group_n"] >= min_demo_group_n, demographic_col].tolist()
                 adoption_demo_df = adoption_demo_df[adoption_demo_df[demographic_col].isin(valid_groups)].copy()
+
+                if not include_missing_responses:
+                    adoption_demo_df = adoption_demo_df[adoption_demo_df["response"] != "Missing"].copy()
+
+                response_order = [
+                    "Extremely interested",
+                    "Very interested",
+                    "Interested",
+                    "Interested / very / extremely interested",
+                    "Moderately interested",
+                    "Somewhat interested",
+                    "Not interested",
+                    "Yes",
+                    "No",
+                    "Missing"
+                ]
+                available_responses = adoption_demo_df["response"].dropna().astype(str).unique().tolist()
+                available_responses = sorted(
+                    available_responses,
+                    key=lambda x: response_order.index(x) if x in response_order else len(response_order)
+                )
+
+                selected_responses = st.multiselect(
+                    "Responses to show",
+                    available_responses,
+                    default=available_responses,
+                    key=f"strategic_response_filter_{adoption_group_label}_{adoption_item_label}"
+                )
+                adoption_demo_df = adoption_demo_df[adoption_demo_df["response"].isin(selected_responses)].copy()
 
                 if adoption_demo_df.empty:
                     st.warning("No demographic groups met the minimum response threshold.")
@@ -2176,11 +2236,41 @@ with tab_interactions:
 
                 adoption_demo_df = segment_data[[demographic_col, adoption_col]].copy()
                 adoption_demo_df[demographic_col] = adoption_demo_df[demographic_col].fillna("Missing").astype(str)
-                adoption_demo_df[adoption_col] = adoption_demo_df[adoption_col].apply(simplify_adoption_response)
+                adoption_demo_df[adoption_col] = adoption_demo_df[adoption_col].apply(lambda x: simplify_adoption_response(x, combine_interest=combine_interest_responses))
+                adoption_demo_df["response"] = adoption_demo_df[adoption_col]
 
                 group_sizes = adoption_demo_df.groupby(demographic_col).size().reset_index(name="group_n")
                 valid_groups = group_sizes.loc[group_sizes["group_n"] >= min_demo_group_n, demographic_col].tolist()
                 adoption_demo_df = adoption_demo_df[adoption_demo_df[demographic_col].isin(valid_groups)].copy()
+
+                if not include_missing_responses:
+                    adoption_demo_df = adoption_demo_df[adoption_demo_df["response"] != "Missing"].copy()
+
+                response_order = [
+                    "Extremely interested",
+                    "Very interested",
+                    "Interested",
+                    "Interested / very / extremely interested",
+                    "Moderately interested",
+                    "Somewhat interested",
+                    "Not interested",
+                    "Yes",
+                    "No",
+                    "Missing"
+                ]
+                available_responses = adoption_demo_df["response"].dropna().astype(str).unique().tolist()
+                available_responses = sorted(
+                    available_responses,
+                    key=lambda x: response_order.index(x) if x in response_order else len(response_order)
+                )
+
+                selected_responses = st.multiselect(
+                    "Responses to show",
+                    available_responses,
+                    default=available_responses,
+                    key=f"strategic_response_filter_{adoption_group_label}_{adoption_item_label}"
+                )
+                adoption_demo_df = adoption_demo_df[adoption_demo_df["response"].isin(selected_responses)].copy()
 
                 if adoption_demo_df.empty:
                     st.warning("No demographic groups met the minimum response threshold.")
